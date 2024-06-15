@@ -80,10 +80,10 @@ class VM {
                 }
                 case 0x06: {
                     const exp = this.readString();
+                    this.ip++; // skip null terminator
                     const flags = this.readString();
                     this.push(new RegExp(exp, flags));
-                    window.regex = this.peek();
-                    console.log("OP_REGEX", this.peek());
+                    console.log(`OP_REGEX exp=${exp} flags=${flags}`);
                     break;
                 }
                 default: {

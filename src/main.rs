@@ -145,6 +145,7 @@ impl Compiler {
 
     fn emit_string(&mut self, s: &str) {
         self.bytecode.extend_from_slice(s.as_bytes());
+        self.bytecode.push(0x00);
     }
 
     fn emit_op(&mut self, op: Operation) {
@@ -157,7 +158,6 @@ impl Compiler {
         match op { // match opcode and push operands
             Operation::LoadString(s) => {
                 self.emit_string(&s);
-                self.bytecode.push(0x00);
             }
             Operation::LoadFloat64(n) => {
                 let bytes = n.to_le_bytes();
