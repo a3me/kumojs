@@ -1,24 +1,56 @@
-class VM {
+class VirtualFunction {
+    constructor(code) {
+        this.code = new Uint8Array(code);
+    }
+}
 
+class StackFrame {
+    constructor(func) {
+        this.func = func;
+    }
+}
+
+class VM {
     constructor(bytecode) {
+        // setup virtual functions
+        this.functions = [];
+        for (const funcCode of bytecode) {
+            const func = new VirtualFunction(funcCode);
+            this.functions.push(func);
+        }
+
+        // init ip and stack 
         this.ip = 0;
-        this.bytecode = bytecode;
         this.stack = [];
+
+        // init call stack with main function
+        this.callStack = [new StackFrame(this.functions[0])];
+        this.bytecode = this.functions[0].code;
     }
 
     printStack() {
         console.log(`STACK:${this.stack.slice().join(', ')}`);
     }
 
-    readByte() {
+    readUInt8() {
         return this.bytecode[++this.ip];
     }
 
+    readUInt16() {
+        return this.bytecode[++this.ip] | (this.bytecode[++this.ip] << 8);
+    }
+
+    readUInt32() {
+        return this.bytecode[++this.ip] |
+            (this.bytecode[++this.ip] << 8) |
+            (this.bytecode[++this.ip] << 16) |
+            (this.bytecode[++this.ip] << 24);
+    }
+
     readFloat64() {
-        const buffer = new ArrayBuffer(8);
-        const dataview = new DataView(buffer);
+        const dataview = new DataView(new ArrayBuffer(8));
         for (let i = 0; i < 8; i++) {
-            dataview.setUint8(i, this.readByte());
+            dataview.setUint8(i, this.readUInt8());
         }
         return dataview.getFloat64(0, true);
     }
@@ -64,7 +96,7 @@ class VM {
                     break;
                 }
                 case 0x03: {
-                    this.stack.push(this.readByte() === 0x01);
+                    this.stack.push(this.readUInt8() === 0x01);
                     console.log("OP_LOAD_BOOL", this.peek());
                     break;
                 }
@@ -75,7 +107,7 @@ class VM {
                 }
                 case 0x05: {
                     this.push(null);
-                    console.log("OP_NULL", this.peek());
+                    console.log("OP_NULL");
                     break;
                 }
                 case 0x06: {
@@ -86,6 +118,22 @@ class VM {
                     console.log(`OP_REGEX exp=${exp} flags=${flags}`);
                     break;
                 }
+                case 0x07: {
+                    this.push(undefined);
+                    console.log("OP_UNDEFINED");
+                    break;
+                }
+                case 0x08: {
+                    this.callStack.pop();
+                    const returnValue = this.pop();
+                    if (this.callStack.length === 0) {
+                        console.log("OP_RETURN (main)", returnValue);
+                        return returnValue;
+                    }
+                    this.push(returnValue);
+                    console.log("OP_RETURN", returnValue);
+                    return returnValue;
+                }
                 default: {
                     console.log("Unknown opcode: " + op);
                     return;
@@ -95,10 +143,3 @@ class VM {
         this.printStack();
     }
 }
-
-fetch("bytecode.json")
-    .then(response => response.json())
-    .then(bytecode => {
-        const vm = new VM(bytecode);
-        vm.run();
-    });
