@@ -12,3 +12,4 @@ swc_core = { version = "0.93.3", features = ["common", "ecma_codegen", "swc_ecma
 swc_ecma_ast = "0.113.7"
 swc_ecma_parser = "0.144.2"
 swc_ecma_visit = "0.99.1"
+thiserror = "1.0.61"

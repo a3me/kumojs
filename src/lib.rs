@@ -1,20 +1,33 @@
+use thiserror::Error;
+use core::panic;
 use std::collections::HashMap;
-use std::cell::RefCell;
-use std::rc::Rc;
+use core::fmt::Error;
 use std::path::Path;
 use std::time::Instant;
 use swc_common::errors::{ColorConfig, Handler};
 use swc_common::sync::Lrc;
 use swc_common::SourceMap;
-use swc_ecma_ast::{Expr, Ident, Lit, MemberExpr, MemberProp, Module, Pat, VarDecl, VarDeclarator};
+use swc_ecma_ast::{Expr, Ident, FnDecl, Lit, MemberExpr, MemberProp, Module, Pat, VarDecl, VarDeclarator};
 use swc_ecma_parser::{lexer::Lexer, Parser, StringInput, Syntax};
 use swc_ecma_visit::{Visit, VisitWith};
 
 pub struct Compiler<'a> {
     bytecode: Vec<u8>,
+    local_count: usize,
+    locals: [Option<Local>; 256],
     current_scope_depth: usize,
     scope: HashMap<String, usize>,
     enclosing: Option<&'a Compiler<'a>>,
+}
+
+#[derive(Error, Debug)]
+pub enum CompileError {
+    #[error("failed to load file: {0}")]
+    LoadFileError(String),
+    #[error("parse error: {0}")]
+    ParseError(String),
+    #[error("too many locals, max number of locals supported is 256")]
+    TooManyLocals,
 }
 
 struct VirtualFunction {
@@ -26,6 +39,11 @@ struct VirtualFunction {
 enum VirtualFunctionType {
     Function,
     Script,
+}
+
+struct Local {
+    name: String,
+    depth: usize,
 }
 
 #[derive(Debug)]
@@ -74,10 +92,14 @@ impl Operation {
     }
 }
 
+const LOCAL_REPEAT_VALUE: Option<Local> = None;
+
 impl<'a> Compiler<'a> {
     pub fn new() -> Self {
         Compiler {
             bytecode: Vec::new(),
+            local_count: 0,
+            locals: [LOCAL_REPEAT_VALUE; 256],
             scope: HashMap::new(),
             current_scope_depth: 0,
             enclosing: None,
@@ -88,19 +110,21 @@ impl<'a> Compiler<'a> {
         Compiler {
             bytecode: Vec::new(),
             scope: HashMap::new(),
+            local_count: 0,
+            locals: [LOCAL_REPEAT_VALUE; 256],
             current_scope_depth: self.current_scope_depth + 1,
             enclosing: None,
         }
     }
 
-    pub fn compile_file(&mut self, path: &Path) -> Vec<u8> {
+    pub fn compile_file(&mut self, path: &Path) -> Result<Vec<u8>, CompileError> {
         let cm: Lrc<SourceMap> = Default::default();
 
         let handler = Handler::with_tty_emitter(ColorConfig::Auto, true, false, Some(cm.clone()));
 
         let fm = cm
             .load_file(path)
-            .expect("failed to load scripts/example.js");
+            .map_err(|e| CompileError::LoadFileError(e.to_string()))?;
 
         let lexer = Lexer::new(
             Syntax::Es(Default::default()),
@@ -122,13 +146,13 @@ impl<'a> Compiler<'a> {
             .parse_module()
             .map_err(|e| {
                 // Unrecoverable fatal error occurred
-                e.into_diagnostic(&handler).emit()
-            })
-            .expect("failed to parse module");
+                e.into_diagnostic(&handler).emit();
+                CompileError::ParseError("failed to parse module".into())
+            })?;
 
         println!("parsing took {:?}", Instant::now() - parse_start);
 
-        self.compile(&module)
+        Ok(self.compile(&module))
     }
 
     pub fn compile(&mut self, module: &Module) -> Vec<u8> {
@@ -138,15 +162,24 @@ impl<'a> Compiler<'a> {
         self.bytecode.clone()
     }
 
-    // fn enter_scope(&mut self) {
-    //     self.current_scope_depth += 1;
-    //     self.scopes.push(HashMap::new());
-    // }
+    fn enter_scope(&mut self) {
+        self.current_scope_depth += 1;
+    }
 
-    // fn exit_scope(&mut self) {
-    //     self.current_scope_depth -= 1;
-    //     self.scopes.pop();
-    // }
+    fn exit_scope(&mut self) {
+        self.current_scope_depth -= 1;
+    }
+
+    fn add_local(&mut self, name: String, depth: usize) {
+        if self.local_count >= 256 {
+            todo!("too many locals, max number of locals supported is 256");
+        }
+        self.locals[self.local_count as usize] = Some(Local {
+            name,
+            depth,
+        });
+        self.local_count += 1;
+    }
 
     fn declare_variable(&mut self, name: String) {
         self.scope.insert(name, self.current_scope_depth);
@@ -267,5 +300,10 @@ impl Visit for Compiler<'_> {
     fn visit_var_decl(&mut self, n: &VarDecl) {
         self.compile_var_decl(n);
         n.visit_children_with(self);
+    }
+    fn visit_fn_decl(&mut self,n: &FnDecl) {
+        self.enter_scope();
+        n.visit_children_with(self);
+        self.exit_scope();
     }
 }
