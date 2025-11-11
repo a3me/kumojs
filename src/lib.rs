@@ -1,15 +1,16 @@
-use thiserror::Error;
-use core::panic;
+use std::borrow::BorrowMut;
 use std::collections::HashMap;
-use core::fmt::Error;
 use std::path::Path;
 use std::time::Instant;
 use swc_common::errors::{ColorConfig, Handler};
 use swc_common::sync::Lrc;
 use swc_common::SourceMap;
-use swc_ecma_ast::{Expr, Ident, FnDecl, Lit, MemberExpr, MemberProp, Module, Pat, VarDecl, VarDeclarator};
+use swc_ecma_ast::{
+    Expr, FnDecl, Ident, Lit, MemberExpr, MemberProp, Module, Pat, VarDecl, VarDeclarator,
+};
 use swc_ecma_parser::{lexer::Lexer, Parser, StringInput, Syntax};
 use swc_ecma_visit::{Visit, VisitWith};
+use thiserror::Error;
 
 pub struct Compiler<'a> {
     bytecode: Vec<u8>,
@@ -142,13 +143,11 @@ impl<'a> Compiler<'a> {
         // parse input js
         let parse_start = Instant::now();
 
-        let module = parser
-            .parse_module()
-            .map_err(|e| {
-                // Unrecoverable fatal error occurred
-                e.into_diagnostic(&handler).emit();
-                CompileError::ParseError("failed to parse module".into())
-            })?;
+        let module = parser.parse_module().map_err(|e| {
+            // Unrecoverable fatal error occurred
+            e.into_diagnostic(&handler).emit();
+            CompileError::ParseError("failed to parse module".into())
+        })?;
 
         println!("parsing took {:?}", Instant::now() - parse_start);
 
@@ -174,15 +173,14 @@ impl<'a> Compiler<'a> {
         if self.local_count >= 256 {
             todo!("too many locals, max number of locals supported is 256");
         }
-        self.locals[self.local_count as usize] = Some(Local {
-            name,
-            depth,
-        });
+        self.locals[self.local_count as usize] = Some(Local { name, depth });
         self.local_count += 1;
     }
 
     fn declare_variable(&mut self, name: String) {
-        self.scope.insert(name, self.current_scope_depth);
+        if self.current_scope_depth > 0 {
+            self.add_local(name, self.current_scope_depth)
+        }
     }
 
     // fn resolve_variable(&self, name: &str) -> Option<usize> {
@@ -208,7 +206,7 @@ impl<'a> Compiler<'a> {
         }
         match &var_declator.name {
             Pat::Ident(name) => {
-                println!("{:?}", name.id.sym.to_string());
+                println!("var ident: {:?}", name.id.sym.to_string());
                 self.declare_variable(name.id.sym.to_string());
                 self.emit_op(Operation::StoreVar(name.id.to_string()));
             }
@@ -301,7 +299,8 @@ impl Visit for Compiler<'_> {
         self.compile_var_decl(n);
         n.visit_children_with(self);
     }
-    fn visit_fn_decl(&mut self,n: &FnDecl) {
+    fn visit_fn_decl(&mut self, n: &FnDecl) {
+        self.new_enclosing();
         self.enter_scope();
         n.visit_children_with(self);
         self.exit_scope();

@@ -4,3 +4,4 @@
 /@222/g;
 true;
 null;
+var a = "hello world";

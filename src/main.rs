@@ -1,28 +1,36 @@
 use kumojs::Compiler;
-use serde_json;
-use std::fs::File;
-use std::io::Write;
+use serde::Serialize;
 use std::path::Path;
-use std::time::Instant;
+use warp::Filter;
 
-fn main() {
+#[derive(Serialize)]
+struct CompileResponse {
+    bytecode: Vec<u8>,
+    error: String,
+}
+
+fn compile() -> CompileResponse {
     let mut compiler = Compiler::new();
 
     let compilation = compiler.compile_file(&Path::new("scripts/example.js"));
 
     match compilation {
         Ok(bytecode) => {
-            let bytecode_json =
-                serde_json::to_string(&bytecode).expect("failed to serialize bytecode");
-
-            let mut file = File::create(Path::new("vm/bytecode.json"))
-                .expect("failed to create bytecode file");
-
-            file.write_all(bytecode_json.as_bytes())
-                .expect("failed to write to bytecode file");
-
-            println!("{:?}", bytecode);
+            CompileResponse { bytecode, error: "".to_string() }
         }
-        Err(e) => println!("{:?}", e),
+        Err(e) => { 
+            CompileResponse { bytecode: [].to_vec(), error: e.to_string() }
+        }
     }
+}
+
+#[tokio::main]
+async fn main() {
+    let compile_route = warp::path("compile").map(|| warp::reply::json(&compile()));
+
+    let vm_static_path = warp::path::end().and(warp::fs::dir("vm"));
+
+    let routes = vm_static_path.or(compile_route);
+
+    warp::serve(routes).run(([127, 0, 0, 1], 3030)).await;
 }
