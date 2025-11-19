@@ -7,9 +7,9 @@
 </head>
 
 <body>
-    <script src="vm.js"></script>
+    <script src="/vm.js"></script>
     <script>
-        fetch("bytecode.json")
+        fetch("/compile")
             .then(response => response.json())
             .then(bytecode => {
                 const vm = new VM([bytecode]);

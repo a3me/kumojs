@@ -1,7 +1,6 @@
-"hello world";
-420;
-1.1;
-/@222/g;
-true;
-null;
+// local var a will have stack slot 0
+// push string to stack at 0
 var a = "hello world";
+
+console.log;
+// console.log(a);

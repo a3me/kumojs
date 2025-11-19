@@ -1,12 +1,12 @@
-use std::borrow::BorrowMut;
+use std::any::Any;
 use std::collections::HashMap;
 use std::path::Path;
 use std::time::Instant;
 use swc_common::errors::{ColorConfig, Handler};
 use swc_common::sync::Lrc;
-use swc_common::SourceMap;
+use swc_common::{SourceMap};
 use swc_ecma_ast::{
-    Expr, FnDecl, Ident, Lit, MemberExpr, MemberProp, Module, Pat, VarDecl, VarDeclarator,
+    CallExpr, Expr, FnDecl, Lit, MemberExpr, Module, Pat, VarDecl, VarDeclarator,
 };
 use swc_ecma_parser::{lexer::Lexer, Parser, StringInput, Syntax};
 use swc_ecma_visit::{Visit, VisitWith};
@@ -59,6 +59,13 @@ enum Operation {
     Regex(String, String),
     StoreVar(String),
     LoadVar(String),
+    UInt8(u8),
+    UInt16(u16),
+    UInt32(u32),
+    UInt64(u64),
+    Call,
+    GetProperty,
+    SetProperty,
 }
 
 impl Operation {
@@ -74,6 +81,13 @@ impl Operation {
             Operation::Return => 0x08,
             Operation::StoreVar(_) => 0x09,
             Operation::LoadVar(_) => 0x0a,
+            Operation::UInt8(_) => 0x0b,
+            Operation::UInt16(_) => 0x0c,
+            Operation::UInt32(_) => 0x0d,
+            Operation::UInt64(_) => 0x0e,
+            Operation::Call => 0x0f,
+            Operation::GetProperty => 0x10,
+            Operation::SetProperty => 0x11,
         }
     }
 
@@ -89,6 +103,13 @@ impl Operation {
             Operation::Regex(_, _) => "OP_REGEX",
             Operation::StoreVar(_) => "OP_STORE_VAR",
             Operation::LoadVar(_) => "OP_LOAD_VAR",
+            Operation::UInt8(_) => "OP_UINT_8",
+            Operation::UInt16(_) => "OP_UINT_16",
+            Operation::UInt32(_) => "OP_UINT_32",
+            Operation::UInt64(_) => "OP_UINT_64",
+            Operation::Call => "OP_CALL",
+            Operation::GetProperty => "OP_GET_PROPERTY",
+            Operation::SetProperty => "OP_SET_PROPERTY",
         }
     }
 }
@@ -219,10 +240,52 @@ impl<'a> Compiler<'a> {
         }
     }
 
+    fn compile_call(&mut self, expr: &CallExpr) {
+        // push function onto stack
+        // callee
+        // push "this" onto stack
+
+        // push args onto stack
+        for arg in &expr.args {
+            // TODO: figure out how to deal with span
+            self.compile_expr(&arg.expr);
+        }
+        // push number of args onto stack
+        let arg_len = expr.args.len().try_into().unwrap();
+        self.emit_op(Operation::UInt64(arg_len));
+        self.emit_op(Operation::Call);
+    }
+
+    fn compile_member_expr(&mut self, member_expr: &MemberExpr) {
+        self.compile_expr(&member_expr.obj);
+
+        // TODO: support these member expr cases
+        // if member_expr.prop.is_private_name() 
+        // if member_expr.prop.is_ident() 
+        if member_expr.prop.is_computed() {
+            match member_expr.prop.as_computed() {
+                Some(computed_prop_name) => {
+                    self.compile_expr(&computed_prop_name.expr);
+                }
+                None => {}
+            }
+        }
+        
+        self.emit_op(Operation::GetProperty);
+    }
+
     fn compile_expr(&mut self, expr: &Expr) {
         match expr {
             Expr::Lit(lit) => self.compile_lit(lit),
-            _ => unimplemented!(),
+            Expr::Call(call_expr) => self.compile_call(call_expr),
+            Expr::Member(member_expr) => self.compile_member_expr(member_expr),
+            Expr::Ident(ident) => {
+                self.emit_op(Operation::LoadVar(ident.sym.to_string()));
+            }
+            _ => {
+                println!("expression unimplemented:");
+                println!("span={:?}", expr.type_id());
+            }
         }
         self.emit_op(Operation::Pop);
     }
@@ -276,11 +339,24 @@ impl<'a> Compiler<'a> {
                 self.emit_string(&exp);
                 self.emit_string(&flags);
             }
-            Operation::Return => {}
-            Operation::Undefined => {}
-            Operation::Pop => {}
-            Operation::Null => {}
+            Operation::UInt8(n) => {
+                let bytes = n.to_le_bytes();
+                self.bytecode.extend_from_slice(&bytes);
+            }
+            Operation::UInt16(n) => {
+                let bytes = n.to_le_bytes();
+                self.bytecode.extend_from_slice(&bytes);
+            }
+            Operation::UInt32(n) => {
+                let bytes = n.to_le_bytes();
+                self.bytecode.extend_from_slice(&bytes);
+            }
+            Operation::UInt64(n) => {
+                let bytes = n.to_le_bytes();
+                self.bytecode.extend_from_slice(&bytes);
+            }
             Operation::LoadVar(_) => todo!(),
+            _ => {}
         }
     }
 

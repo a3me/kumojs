@@ -134,6 +134,20 @@ class VM {
                     console.log("OP_RETURN", returnValue);
                     return returnValue;
                 }
+                case 0x09: {
+                    const varName = this.readString();
+                    const value = this.pop();
+                    this[varName] = value;
+                    console.log(`OP_STORE_VAR ${varName} =`, value);
+                    break;
+                }
+                case 0x0A: {
+                    const varName = this.readString();
+                    const value = this[varName];
+                    this.push(value);
+                    console.log(`OP_LOAD_VAR ${varName} ->`, value);
+                    break;
+                }
                 default: {
                     console.log("Unknown opcode: " + op);
                     return;
