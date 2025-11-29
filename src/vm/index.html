@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <meta charset="utf-8">
+    <title>kumojs</title>
+    <link rel="icon" href="/public/cloud.png" type="image/png">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.11.1/highlight.min.js"></script>
+    <link rel="stylesheet"
+        href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.11.1/styles/atom-one-dark.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.11.1/languages/javascript.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.11.1/languages/json.min.js"></script>
+    <style>
+        body {
+            background-color: #282c34;
+            color: #abb2bf;
+            font-family: Arial, sans-serif;
+            margin: 20px;
+        }
+
+        h1 {
+            text-align: center;
+            margin: 0;
+        }
+
+        #source-code-pre,
+        #bytecode-pre {
+            width: 50%;
+            box-sizing: border-box;
+            background-color: #282c34;
+            border: 1px solid #3a3f4b;
+            max-height: 50vh;
+            overflow-y: auto;
+        }
+
+        #source-code,
+        #bytecode {
+            padding-top: 0;
+            padding-bottom: 0;
+        }
+
+        #output {
+            margin-top: 20px;
+            padding: 10px;
+            background-color: #21252b;
+            border: 1px solid #3a3f4b;
+            max-height: 30vh;
+            overflow-y: auto;
+        }
+    </style>
+</head>
+
+<body>
+    <h1>kumojs</h1>
+
+    <div id="container">
+        <div id="code-container" style="display: flex; gap: 20px;">
+            <pre id="source-code-pre" class="language-javascript">
+                <code id="source-code"></code>
+            </pre>
+            <pre id="bytecode-pre" class="language-json">
+                <code id="bytecode"></code>
+            </pre>
+        </div>
+        <div id="output"></div>
+    </div>
+
+    <script src="/vm/vm.js"></script>
+
+    <script type="module">
+        // get display elements
+        const bytecodeElement = document.querySelector("#bytecode");
+        const sourceCodeElement = document.querySelector("#source-code");
+        const outputDiv = document.getElementById("output");
+
+        // fetch source code
+        const sourceResponse = await fetch("/scripts/example.js");
+        const source = await sourceResponse.text();
+        sourceCodeElement.textContent = source;
+
+        // compile to bytecode
+        const compileResponse = await fetch("/compile");
+        const resp = await compileResponse.json();
+        bytecodeElement.textContent = JSON.stringify(resp.bytecode, null, 2);
+
+        // initialize and run vm with compiled bytecode
+        const vm = new VM([resp.bytecode], {
+            debug: true,
+            debugLog: (...data) => {
+                const logEntry = document.createElement("div");
+                logEntry.textContent = data.map(d => (typeof d === 'object' ? JSON.stringify(d) : d)).join(' ');
+                outputDiv.appendChild(logEntry);
+            }
+        });
+
+        // highlight code blocks
+        hljs.highlightAll();
+
+        // run the vm
+        vm.run();
+    </script>
+</body>
+
+</html>

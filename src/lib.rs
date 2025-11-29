@@ -4,10 +4,8 @@ use std::path::Path;
 use std::time::Instant;
 use swc_common::errors::{ColorConfig, Handler};
 use swc_common::sync::Lrc;
-use swc_common::{SourceMap};
-use swc_ecma_ast::{
-    CallExpr, Expr, FnDecl, Lit, MemberExpr, Module, Pat, VarDecl, VarDeclarator,
-};
+use swc_common::SourceMap;
+use swc_ecma_ast::{CallExpr, Expr, FnDecl, Lit, MemberExpr, Module, Pat, VarDecl, VarDeclarator};
 use swc_ecma_parser::{lexer::Lexer, Parser, StringInput, Syntax};
 use swc_ecma_visit::{Visit, VisitWith};
 use thiserror::Error;
@@ -205,7 +203,7 @@ impl<'a> Compiler<'a> {
     }
 
     // fn resolve_variable(&self, name: &str) -> Option<usize> {
-    //     for (i, scope) in self.scopes.iter().enumerate().rev() {
+    //     for (i, scope) in self.scope.iter().enumerate().rev() {
     //         if let Some(depth) = scope.get(name) {
     //             return Some(self.current_scope_depth - i);
     //         }
@@ -229,7 +227,6 @@ impl<'a> Compiler<'a> {
             Pat::Ident(name) => {
                 println!("var ident: {:?}", name.id.sym.to_string());
                 self.declare_variable(name.id.sym.to_string());
-                self.emit_op(Operation::StoreVar(name.id.to_string()));
             }
             Pat::Array(_) => todo!(),
             Pat::Rest(_) => todo!(),
@@ -260,8 +257,8 @@ impl<'a> Compiler<'a> {
         self.compile_expr(&member_expr.obj);
 
         // TODO: support these member expr cases
-        // if member_expr.prop.is_private_name() 
-        // if member_expr.prop.is_ident() 
+        // if member_expr.prop.is_private_name()
+        // if member_expr.prop.is_ident()
         if member_expr.prop.is_computed() {
             match member_expr.prop.as_computed() {
                 Some(computed_prop_name) => {
@@ -270,7 +267,7 @@ impl<'a> Compiler<'a> {
                 None => {}
             }
         }
-        
+
         self.emit_op(Operation::GetProperty);
     }
 
@@ -355,7 +352,9 @@ impl<'a> Compiler<'a> {
                 let bytes = n.to_le_bytes();
                 self.bytecode.extend_from_slice(&bytes);
             }
-            Operation::LoadVar(_) => todo!(),
+            Operation::LoadVar(name) => {
+                self.emit_string(&name);
+            }
             _ => {}
         }
     }

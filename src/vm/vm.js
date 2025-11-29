@@ -11,7 +11,13 @@ class StackFrame {
 }
 
 class VM {
-    constructor(bytecode) {
+    constructor(bytecode, options) {
+
+        this.options = options || {
+            debug: false,
+            debugLog: undefined
+        };
+
         // setup virtual functions
         this.functions = [];
         for (const funcCode of bytecode) {
@@ -28,8 +34,15 @@ class VM {
         this.bytecode = this.functions[0].code;
     }
 
+    log(...data) {
+        console.log(...data);
+        if (this.options.debug && this.options.debugLog) {
+            this.options.debugLog(...data);
+        }
+    }
+
     printStack() {
-        console.log(`STACK:${this.stack.slice().join(', ')}`);
+        this.log(`STACK:${this.stack.slice().join(', ')}`);
     }
 
     readUInt8() {
@@ -77,37 +90,36 @@ class VM {
     }
 
     run() {
-        console.log('bytecode', this.bytecode);
-
         for (; this.ip < this.bytecode.length; this.ip++) {
             // get current opcode
             const op = this.bytecode[this.ip];
+            
             // switch on opcode and execute operation
             switch (op) {
                 case 0x01: {
                     this.push(this.readString());
-                    console.log("OP_LOAD_STRING", this.peek());
+                    this.log("OP_LOAD_STRING", this.peek());
                     break;
                 }
                 case 0x02: {
                     const number = this.readFloat64();
                     this.stack.push(number);
-                    console.log("OP_LOAD_FLOAT64", this.peek());
+                    this.log("OP_LOAD_FLOAT64", this.peek());
                     break;
                 }
                 case 0x03: {
                     this.stack.push(this.readUInt8() === 0x01);
-                    console.log("OP_LOAD_BOOL", this.peek());
+                    this.log("OP_LOAD_BOOL", this.peek());
                     break;
                 }
                 case 0x04: {
                     const popped = this.pop();
-                    console.log("OP_POP", popped);
+                    this.log("OP_POP", popped);
                     break;
                 }
                 case 0x05: {
                     this.push(null);
-                    console.log("OP_NULL");
+                    this.log("OP_NULL");
                     break;
                 }
                 case 0x06: {
@@ -115,41 +127,41 @@ class VM {
                     this.ip++; // skip null terminator
                     const flags = this.readString();
                     this.push(new RegExp(exp, flags));
-                    console.log(`OP_REGEX exp=${exp} flags=${flags}`);
+                    this.log(`OP_REGEX exp=${exp} flags=${flags}`);
                     break;
                 }
                 case 0x07: {
                     this.push(undefined);
-                    console.log("OP_UNDEFINED");
+                    this.log("OP_UNDEFINED");
                     break;
                 }
                 case 0x08: {
                     this.callStack.pop();
                     const returnValue = this.pop();
                     if (this.callStack.length === 0) {
-                        console.log("OP_RETURN (main)", returnValue);
+                        this.log("OP_RETURN (main)", returnValue);
                         return returnValue;
                     }
                     this.push(returnValue);
-                    console.log("OP_RETURN", returnValue);
+                    this.log("OP_RETURN", returnValue);
                     return returnValue;
                 }
                 case 0x09: {
                     const varName = this.readString();
                     const value = this.pop();
                     this[varName] = value;
-                    console.log(`OP_STORE_VAR ${varName} =`, value);
+                    this.log(`OP_STORE_VAR ${varName} =`, value);
                     break;
                 }
                 case 0x0A: {
                     const varName = this.readString();
                     const value = this[varName];
                     this.push(value);
-                    console.log(`OP_LOAD_VAR ${varName} ->`, value);
+                    this.log(`OP_LOAD_VAR ${varName} ->`, value);
                     break;
                 }
                 default: {
-                    console.log("Unknown opcode: " + op);
+                    this.log("Unknown opcode: " + op);
                     return;
                 }
             }

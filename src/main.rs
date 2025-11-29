@@ -12,15 +12,17 @@ struct CompileResponse {
 fn compile() -> CompileResponse {
     let mut compiler = Compiler::new();
 
-    let compilation = compiler.compile_file(&Path::new("scripts/example.js"));
+    let compilation = compiler.compile_file(&Path::new("src/scripts/example.js"));
 
     match compilation {
-        Ok(bytecode) => {
-            CompileResponse { bytecode, error: "".to_string() }
-        }
-        Err(e) => { 
-            CompileResponse { bytecode: [].to_vec(), error: e.to_string() }
-        }
+        Ok(bytecode) => CompileResponse {
+            bytecode,
+            error: "".to_string(),
+        },
+        Err(e) => CompileResponse {
+            bytecode: [].to_vec(),
+            error: e.to_string(),
+        },
     }
 }
 
@@ -28,9 +30,9 @@ fn compile() -> CompileResponse {
 async fn main() {
     let compile_route = warp::path("compile").map(|| warp::reply::json(&compile()));
 
-    let vm_static_path = warp::path::end().and(warp::fs::dir("vm"));
+    let vm_static_path = warp::fs::dir("src");
 
-    let routes = vm_static_path.or(compile_route);
+    let routes = compile_route.or(vm_static_path);
 
     warp::serve(routes).run(([127, 0, 0, 1], 3030)).await;
 }
