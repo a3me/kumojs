@@ -5,7 +5,9 @@ use std::time::Instant;
 use swc_common::errors::{ColorConfig, Handler};
 use swc_common::sync::Lrc;
 use swc_common::SourceMap;
-use swc_ecma_ast::{CallExpr, Expr, FnDecl, Lit, MemberExpr, Module, Pat, VarDecl, VarDeclarator};
+use swc_ecma_ast::{
+    BinExpr, BinaryOp, CallExpr, Expr, FnDecl, Lit, MemberExpr, Module, Pat, VarDecl, VarDeclarator,
+};
 use swc_ecma_parser::{lexer::Lexer, Parser, StringInput, Syntax};
 use swc_ecma_visit::{Visit, VisitWith};
 use thiserror::Error;
@@ -47,23 +49,83 @@ struct Local {
 
 #[derive(Debug)]
 enum Operation {
-    Return,
-    LoadString(String),
-    LoadFloat64(f64),
-    Bool(bool),
     Pop,
-    Null,
-    Undefined,
-    Regex(String, String),
-    StoreVar(String),
-    LoadVar(String),
+    Return,
+    LoadFloat64(f64),
     UInt8(u8),
     UInt16(u16),
     UInt32(u32),
     UInt64(u64),
+    /// "kumo"
+    LoadString(String),
+    /// true
+    Bool(bool),
+    /// null
+    Null,
+    /// `undefined`
+    Undefined,
+    ///
+    Regex(String, String),
+    /// x = 1
+    StoreVar(String),
+    /// x
+    LoadVar(String),
+    /// x()
     Call,
+    /// x.a
     GetProperty,
+    /// x.a = b
     SetProperty,
+    /// `==`
+    EqEq,
+    /// `!=`
+    NotEq,
+    /// `===`
+    EqEqEq,
+    /// `!==`
+    NotEqEq,
+    /// `<`
+    Lt,
+    /// `<=`
+    LtEq,
+    /// `>`
+    Gt,
+    /// `>=`
+    GtEq,
+    /// `<<`
+    LShift,
+    /// `>>`
+    RShift,
+    /// `>>>`
+    ZeroFillRShift,
+    /// `+`
+    Add,
+    /// `-`
+    Sub,
+    /// `*`
+    Mul,
+    /// `/`
+    Div,
+    /// `%`
+    Mod,
+    /// `|`
+    BitOr,
+    /// `^`
+    BitXor,
+    /// `&`
+    BitAnd,
+    /// `||`
+    LogicalOr,
+    /// `&&`
+    LogicalAnd,
+    /// `in`
+    In,
+    /// `instanceof`
+    InstanceOf,
+    /// `**`
+    Exp,
+    /// `??`
+    NullishCoalescing,
 }
 
 impl Operation {
@@ -86,6 +148,31 @@ impl Operation {
             Operation::Call => 0x0f,
             Operation::GetProperty => 0x10,
             Operation::SetProperty => 0x11,
+            Operation::EqEq => 0x12,
+            Operation::NotEq => 0x13,
+            Operation::EqEqEq => 0x14,
+            Operation::NotEqEq => 0x15,
+            Operation::Lt => 0x16,
+            Operation::LtEq => 0x17,
+            Operation::Gt => 0x18,
+            Operation::GtEq => 0x19,
+            Operation::LShift => 0x1a,
+            Operation::RShift => 0x1b,
+            Operation::ZeroFillRShift => 0x1c,
+            Operation::Add => 0x1d,
+            Operation::Sub => 0x1e,
+            Operation::Mul => 0x1f,
+            Operation::Div => 0x20,
+            Operation::Mod => 0x21,
+            Operation::BitOr => 0x22,
+            Operation::BitXor => 0x23,
+            Operation::BitAnd => 0x24,
+            Operation::LogicalOr => 0x25,
+            Operation::LogicalAnd => 0x26,
+            Operation::In => 0x27,
+            Operation::InstanceOf => 0x28,
+            Operation::Exp => 0x29,
+            Operation::NullishCoalescing => 0x2a,
         }
     }
 
@@ -108,6 +195,31 @@ impl Operation {
             Operation::Call => "OP_CALL",
             Operation::GetProperty => "OP_GET_PROPERTY",
             Operation::SetProperty => "OP_SET_PROPERTY",
+            Operation::EqEq => "OP_EQ_EQ",
+            Operation::NotEq => "OP_NOT_EQ",
+            Operation::EqEqEq => "OP_EQ_EQ_EQ",
+            Operation::NotEqEq => "OP_NOT_EQ_EQ",
+            Operation::Lt => "OP_LT",
+            Operation::LtEq => "OP_LT_EQ",
+            Operation::Gt => "OP_GT",
+            Operation::GtEq => "OP_GT_EQ",
+            Operation::LShift => "OP_LSHIFT",
+            Operation::RShift => "OP_RSHIFT",
+            Operation::ZeroFillRShift => "OP_ZERO_FILL_RSHIFT",
+            Operation::Add => "OP_ADD",
+            Operation::Sub => "OP_SUB",
+            Operation::Mul => "OP_MUL",
+            Operation::Div => "OP_DIV",
+            Operation::Mod => "OP_MOD",
+            Operation::BitOr => "OP_BIT_OR",
+            Operation::BitXor => "OP_BIT_XOR",
+            Operation::BitAnd => "OP_BIT_AND",
+            Operation::LogicalOr => "OP_LOGICAL_OR",
+            Operation::LogicalAnd => "OP_LOGICAL_AND",
+            Operation::In => "OP_IN",
+            Operation::InstanceOf => "OP_INSTANCE_OF",
+            Operation::Exp => "OP_EXP",
+            Operation::NullishCoalescing => "OP_NULLISH_COALESCING",
         }
     }
 }
@@ -168,7 +280,7 @@ impl<'a> Compiler<'a> {
             CompileError::ParseError("failed to parse module".into())
         })?;
 
-        println!("parsing took {:?}", Instant::now() - parse_start);
+        eprintln!("parsing took {:?}", Instant::now() - parse_start);
 
         Ok(self.compile(&module))
     }
@@ -176,7 +288,7 @@ impl<'a> Compiler<'a> {
     pub fn compile(&mut self, module: &Module) -> Vec<u8> {
         let compile_start = Instant::now();
         module.visit_with(self);
-        println!("compiling took {:?}", Instant::now() - compile_start);
+        eprintln!("compiling took {:?}", Instant::now() - compile_start);
         self.bytecode.clone()
     }
 
@@ -203,8 +315,8 @@ impl<'a> Compiler<'a> {
     }
 
     // fn resolve_variable(&self, name: &str) -> Option<usize> {
-    //     for (i, scope) in self.scope.iter().enumerate().rev() {
-    //         if let Some(depth) = scope.get(name) {
+    //     for (i, scope) in self.scope.iter().enumerate() {
+    //         if let Some(depth) = scope.1 {
     //             return Some(self.current_scope_depth - i);
     //         }
     //     }
@@ -255,7 +367,6 @@ impl<'a> Compiler<'a> {
 
     fn compile_member_expr(&mut self, member_expr: &MemberExpr) {
         self.compile_expr(&member_expr.obj);
-
         // TODO: support these member expr cases
         // if member_expr.prop.is_private_name()
         // if member_expr.prop.is_ident()
@@ -279,28 +390,53 @@ impl<'a> Compiler<'a> {
             Expr::Ident(ident) => {
                 self.emit_op(Operation::LoadVar(ident.sym.to_string()));
             }
+            Expr::Bin(bin_expr) => self.compile_bin_expr(bin_expr),
             _ => {
                 println!("expression unimplemented:");
                 println!("span={:?}", expr.type_id());
             }
         }
-        self.emit_op(Operation::Pop);
+        // self.emit_op(Operation::Pop);
+    }
+
+    fn compile_bin_expr(&mut self, expr: &BinExpr) {
+        self.compile_expr(&expr.left);
+        self.compile_expr(&expr.right);
+        match expr.op {
+            BinaryOp::Add => self.emit_op(Operation::Add),
+            BinaryOp::Sub => self.emit_op(Operation::Sub),
+            BinaryOp::Mul => self.emit_op(Operation::Mul),
+            BinaryOp::Div => self.emit_op(Operation::Div),
+            BinaryOp::Mod => self.emit_op(Operation::Mod),
+            BinaryOp::EqEq => self.emit_op(Operation::EqEq),
+            BinaryOp::NotEq => self.emit_op(Operation::NotEq),
+            BinaryOp::EqEqEq => self.emit_op(Operation::EqEqEq),
+            BinaryOp::NotEqEq => self.emit_op(Operation::NotEqEq),
+            BinaryOp::Lt => self.emit_op(Operation::Lt),
+            BinaryOp::LtEq => self.emit_op(Operation::LtEq),
+            BinaryOp::Gt => self.emit_op(Operation::Gt),
+            BinaryOp::GtEq => self.emit_op(Operation::GtEq),
+            BinaryOp::LShift => self.emit_op(Operation::LShift),
+            BinaryOp::RShift => self.emit_op(Operation::RShift),
+            BinaryOp::ZeroFillRShift => self.emit_op(Operation::ZeroFillRShift),
+            BinaryOp::BitOr => self.emit_op(Operation::BitOr),
+            BinaryOp::BitXor => self.emit_op(Operation::BitXor),
+            BinaryOp::BitAnd => self.emit_op(Operation::BitAnd),
+            BinaryOp::In => self.emit_op(Operation::In),
+            BinaryOp::InstanceOf => self.emit_op(Operation::InstanceOf),
+            BinaryOp::LogicalAnd => self.emit_op(Operation::LogicalAnd),
+            BinaryOp::LogicalOr => self.emit_op(Operation::LogicalOr),
+            BinaryOp::Exp => self.emit_op(Operation::Exp),
+            BinaryOp::NullishCoalescing => self.emit_op(Operation::NullishCoalescing),
+        }
     }
 
     fn compile_lit(&mut self, lit: &Lit) {
         match lit {
-            Lit::Str(s) => {
-                self.emit_op(Operation::LoadString(s.value.to_string().clone()));
-            }
-            Lit::Num(n) => {
-                self.emit_op(Operation::LoadFloat64(n.value));
-            }
-            Lit::Bool(b) => {
-                self.emit_op(Operation::Bool(b.value));
-            }
-            Lit::Null(_) => {
-                self.emit_op(Operation::Null);
-            }
+            Lit::Str(s) => self.emit_op(Operation::LoadString(s.value.to_string().clone())),
+            Lit::Num(n) => self.emit_op(Operation::LoadFloat64(n.value)),
+            Lit::Bool(b) => self.emit_op(Operation::Bool(b.value)),
+            Lit::Null(_) => self.emit_op(Operation::Null),
             Lit::Regex(r) => {
                 self.emit_op(Operation::Regex(
                     r.exp.to_string().clone(),
@@ -308,16 +444,14 @@ impl<'a> Compiler<'a> {
                 ));
             }
             Lit::BigInt(_) => todo!(),
-            Lit::JSXText(_) => todo!(),
+            Lit::JSXText(_) => unimplemented!(),
         }
     }
 
     fn emit_op(&mut self, op: Operation) {
         self.bytecode.push(op.get_opcode());
         match op {
-            Operation::LoadString(s) => {
-                self.emit_string(&s);
-            }
+            Operation::LoadString(s) => self.emit_string(&s),
             Operation::LoadFloat64(n) => {
                 let bytes = n.to_le_bytes();
                 self.bytecode.extend_from_slice(&bytes);
@@ -329,9 +463,7 @@ impl<'a> Compiler<'a> {
                     self.bytecode.push(0x00);
                 }
             }
-            Operation::StoreVar(name) => {
-                self.emit_string(&name);
-            }
+            Operation::StoreVar(name) => self.emit_string(&name),
             Operation::Regex(exp, flags) => {
                 self.emit_string(&exp);
                 self.emit_string(&flags);
@@ -352,9 +484,7 @@ impl<'a> Compiler<'a> {
                 let bytes = n.to_le_bytes();
                 self.bytecode.extend_from_slice(&bytes);
             }
-            Operation::LoadVar(name) => {
-                self.emit_string(&name);
-            }
+            Operation::LoadVar(name) => self.emit_string(&name),
             _ => {}
         }
     }

@@ -7,6 +7,21 @@ kumojs is an "es3" (see below missing features) javascript compiler written in R
 
 virtualized obfuscation is a growing trend in javascript obfuscation, and kumojs is an attempt to demonstrate an open source implementation of this technique.
 
+## features
+
+- [] variables
+    - [] scope
+    - [] var
+    - [] const
+    - [] let
+- [] closures / scope
+- [] unary operators
+- [] ternary operators
+- [] binary operators
+- [] arrays
+- [] objects
+- [] functions
+
 ## missing es3 features
 
 - [ ] `with` statement
