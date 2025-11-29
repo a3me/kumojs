@@ -498,11 +498,9 @@ impl<'a> Compiler<'a> {
 impl Visit for Compiler<'_> {
     fn visit_expr(&mut self, expr: &Expr) {
         self.compile_expr(expr);
-        expr.visit_children_with(self);
     }
     fn visit_var_decl(&mut self, n: &VarDecl) {
         self.compile_var_decl(n);
-        n.visit_children_with(self);
     }
     fn visit_fn_decl(&mut self, n: &FnDecl) {
         self.new_enclosing();

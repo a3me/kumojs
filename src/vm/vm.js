@@ -35,7 +35,6 @@ class VM {
     }
 
     log(...data) {
-        console.log(...data);
         if (this.options.debug && this.options.debugLog) {
             this.options.debugLog(...data);
         }
@@ -462,4 +461,8 @@ class VM {
         }
         this.printStack();
     }
+}
+
+if (typeof module !== 'undefined' && module.exports) {
+    module.exports = { VM, VirtualFunction, StackFrame };
 }
