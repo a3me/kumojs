@@ -5,8 +5,9 @@ class VirtualFunction {
 }
 
 class StackFrame {
-    constructor(func) {
+    constructor(func, stackBase) {
         this.func = func;
+        this.stackBase = stackBase || 0;  // Index where this frame's locals start
     }
 }
 
@@ -451,6 +452,24 @@ class VM {
                     const result = (a !== null && a !== undefined) ? a : b;
                     this.push(result);
                     this.log(`OP_NULLISH_COALESCING ${a} ?? ${b} =>`, result);
+                    break;
+                }
+                // Operation::GetLocal(_) => 0x2b,
+                case 0x2b: {
+                    const localIndex = this.readUInt8();
+                    const frame = this.callStack[this.callStack.length - 1];
+                    const value = this.stack[frame.stackBase + localIndex];
+                    this.push(value);
+                    this.log(`OP_GET_LOCAL index=${localIndex} stackBase=${frame.stackBase} value=`, value);
+                    break;
+                }
+                // Operation::SetLocal(_) => 0x2c,
+                case 0x2c: {
+                    const localIndex = this.readUInt8();
+                    const value = this.peek();  // Don't pop, assignment is an expression
+                    const frame = this.callStack[this.callStack.length - 1];
+                    this.stack[frame.stackBase + localIndex] = value;
+                    this.log(`OP_SET_LOCAL index=${localIndex} stackBase=${frame.stackBase} value=`, value);
                     break;
                 }
                 default: {

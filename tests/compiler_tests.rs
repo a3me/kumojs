@@ -192,3 +192,27 @@ fn test_nullish_coalescing() {
     run_test("undefined ?? 10", "10");
     run_test("0 ?? 5", "0");
 }
+
+// Local variable tests
+#[test]
+fn test_local_variable_declaration() {
+    run_test("let x = 5; x", "5");
+}
+
+#[test]
+fn test_local_variable_arithmetic() {
+    run_test("let x = 10; let y = 5; x + y", "15");
+}
+
+#[test]
+fn test_multiple_locals() {
+    run_test("let a = 1; let b = 2; let c = 3; a + b + c", "6");
+}
+
+#[test]
+fn test_expression_statement_pop() {
+    // This test verifies that intermediate expression statements are popped
+    // Without proper pop, the stack would grow and local offsets would be wrong
+    run_test("1 + 1; let x = 5; x", "5");
+    run_test("10; 20; let y = 3; y", "3");
+}

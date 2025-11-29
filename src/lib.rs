@@ -6,7 +6,8 @@ use swc_common::errors::{ColorConfig, Handler};
 use swc_common::sync::Lrc;
 use swc_common::SourceMap;
 use swc_ecma_ast::{
-    BinExpr, BinaryOp, CallExpr, Expr, FnDecl, Lit, MemberExpr, Module, Pat, VarDecl, VarDeclarator,
+    BinExpr, BinaryOp, CallExpr, Expr, FnDecl, Lit, MemberExpr, Module, ModuleItem, Pat, Stmt,
+    VarDecl, VarDeclarator,
 };
 use swc_ecma_parser::{lexer::Lexer, Parser, StringInput, Syntax};
 use swc_ecma_visit::{Visit, VisitWith};
@@ -126,6 +127,10 @@ enum Operation {
     Exp,
     /// `??`
     NullishCoalescing,
+    /// Get local variable at stack offset
+    GetLocal(u8),
+    /// Set local variable at stack offset
+    SetLocal(u8),
 }
 
 impl Operation {
@@ -173,6 +178,8 @@ impl Operation {
             Operation::InstanceOf => 0x28,
             Operation::Exp => 0x29,
             Operation::NullishCoalescing => 0x2a,
+            Operation::GetLocal(_) => 0x2b,
+            Operation::SetLocal(_) => 0x2c,
         }
     }
 
@@ -220,6 +227,8 @@ impl Operation {
             Operation::InstanceOf => "OP_INSTANCE_OF",
             Operation::Exp => "OP_EXP",
             Operation::NullishCoalescing => "OP_NULLISH_COALESCING",
+            Operation::GetLocal(_) => "OP_GET_LOCAL",
+            Operation::SetLocal(_) => "OP_SET_LOCAL",
         }
     }
 }
@@ -287,9 +296,51 @@ impl<'a> Compiler<'a> {
 
     pub fn compile(&mut self, module: &Module) -> Vec<u8> {
         let compile_start = Instant::now();
-        module.visit_with(self);
+
+        // process each statement in the module body
+        let body_len = module.body.len();
+        for (i, item) in module.body.iter().enumerate() {
+            let is_last = i == body_len - 1;
+
+            match item {
+                ModuleItem::Stmt(stmt) => {
+                    self.compile_stmt(stmt, is_last);
+                }
+                ModuleItem::ModuleDecl(_) => {
+                    // module declarations like import/export - not supported yet
+                }
+            }
+        }
+
         eprintln!("compiling took {:?}", Instant::now() - compile_start);
         self.bytecode.clone()
+    }
+
+    fn compile_stmt(&mut self, stmt: &Stmt, is_last_in_module: bool) {
+        match stmt {
+            Stmt::Expr(expr_stmt) => {
+                // compile the expression
+                self.compile_expr(&expr_stmt.expr);
+                // pop the result unless it's the last statement in the module
+                // (so the test runner can read it)
+                if !is_last_in_module {
+                    self.emit_op(Operation::Pop);
+                }
+            }
+            Stmt::Decl(decl) => {
+                // handle declarations (variable, function, etc.)
+                decl.visit_with(self);
+            }
+            Stmt::Block(block_stmt) => {
+                for stmt in &block_stmt.stmts {
+                    self.compile_stmt(stmt, false);
+                }
+            }
+            _ => {
+                // for other statement types, use the visitor pattern
+                stmt.visit_with(self);
+            }
+        }
     }
 
     fn enter_scope(&mut self) {
@@ -309,19 +360,22 @@ impl<'a> Compiler<'a> {
     }
 
     fn declare_variable(&mut self, name: String) {
-        if self.current_scope_depth > 0 {
-            self.add_local(name, self.current_scope_depth)
-        }
+        // sll variables are locals in our implementation
+        // they live on the stack at the position determined by local_count
+        self.add_local(name, self.current_scope_depth)
     }
 
-    // fn resolve_variable(&self, name: &str) -> Option<usize> {
-    //     for (i, scope) in self.scope.iter().enumerate() {
-    //         if let Some(depth) = scope.1 {
-    //             return Some(self.current_scope_depth - i);
-    //         }
-    //     }
-    //     None
-    // }
+    fn resolve_local(&self, name: &str) -> Option<u8> {
+        // search locals array backwards (most recent first)
+        for i in (0..self.local_count).rev() {
+            if let Some(ref local) = self.locals[i] {
+                if local.name == name && local.depth <= self.current_scope_depth {
+                    return Some(i as u8);
+                }
+            }
+        }
+        None
+    }
 
     // compile variable declarations
     fn compile_var_decl(&mut self, var_decl: &VarDecl) {
@@ -388,7 +442,12 @@ impl<'a> Compiler<'a> {
             Expr::Call(call_expr) => self.compile_call(call_expr),
             Expr::Member(member_expr) => self.compile_member_expr(member_expr),
             Expr::Ident(ident) => {
-                self.emit_op(Operation::LoadVar(ident.sym.to_string()));
+                let name = ident.sym.to_string();
+                if let Some(local_index) = self.resolve_local(&name) {
+                    self.emit_op(Operation::GetLocal(local_index));
+                } else {
+                    self.emit_op(Operation::LoadVar(name));
+                }
             }
             Expr::Bin(bin_expr) => self.compile_bin_expr(bin_expr),
             Expr::Paren(paren_expr) => self.compile_expr(&paren_expr.expr),
@@ -486,6 +545,12 @@ impl<'a> Compiler<'a> {
                 self.bytecode.extend_from_slice(&bytes);
             }
             Operation::LoadVar(name) => self.emit_string(&name),
+            Operation::GetLocal(index) => {
+                self.bytecode.push(index);
+            }
+            Operation::SetLocal(index) => {
+                self.bytecode.push(index);
+            }
             _ => {}
         }
     }
