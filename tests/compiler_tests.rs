@@ -98,3 +98,97 @@ fn test_complex_expression() {
     run_test("1 + 2 * 3", "7");
     run_test("(1 + 2) * 3", "9");
 }
+
+#[test]
+fn test_lshift() {
+    run_test("2 << 1", "4");
+    run_test("5 << 2", "20");
+}
+
+#[test]
+fn test_rshift() {
+    run_test("8 >> 1", "4");
+    run_test("20 >> 2", "5");
+}
+
+#[test]
+fn test_zero_fill_rshift() {
+    run_test("8 >>> 1", "4");
+    run_test("16 >>> 2", "4");
+}
+
+#[test]
+fn test_bit_or() {
+    run_test("5 | 3", "7");
+    run_test("12 | 10", "14");
+}
+
+#[test]
+fn test_bit_xor() {
+    run_test("5 ^ 3", "6");
+    run_test("12 ^ 10", "6");
+}
+
+#[test]
+fn test_bit_and() {
+    run_test("5 & 3", "1");
+    run_test("12 & 10", "8");
+}
+
+// Logical operations
+#[test]
+fn test_logical_or() {
+    run_test("true || false", "true");
+    run_test("false || false", "false");
+    run_test("0 || 5", "5");
+}
+
+#[test]
+fn test_logical_and() {
+    run_test("true && false", "false");
+    run_test("true && true", "true");
+    run_test("5 && 10", "10");
+}
+
+// Comparison operations
+#[test]
+fn test_equality() {
+    run_test("5 == 5", "true");
+    run_test("5 != 3", "true");
+    run_test("5 != 5", "false");
+}
+
+#[test]
+fn test_strict_equality() {
+    run_test("5 === 5", "true");
+    run_test("5 === \"5\"", "false");
+    run_test("5 !== \"5\"", "true");
+}
+
+#[test]
+fn test_less_than() {
+    run_test("3 < 5", "true");
+    run_test("5 < 3", "false");
+    run_test("3 <= 3", "true");
+}
+
+#[test]
+fn test_greater_than() {
+    run_test("5 > 3", "true");
+    run_test("3 > 5", "false");
+    run_test("5 >= 5", "true");
+}
+
+// Other operations
+#[test]
+fn test_exponentiation() {
+    run_test("2 ** 3", "8");
+    run_test("5 ** 2", "25");
+}
+
+#[test]
+fn test_nullish_coalescing() {
+    run_test("null ?? 5", "5");
+    run_test("undefined ?? 10", "10");
+    run_test("0 ?? 5", "0");
+}
