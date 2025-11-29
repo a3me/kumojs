@@ -29,15 +29,19 @@ fn compile_source(source: &str) -> Vec<u8> {
     compiler.compile(&module)
 }
 
-#[test]
-fn test_one_plus_one() {
-    // compile source
-    let source = "1 + 1";
+fn run_test(source: &str, expected_result: &str) {
     let bytecode = compile_source(source);
 
     // bytecode to temp file
     let temp_dir = std::env::temp_dir();
-    let bytecode_path = temp_dir.join("test_one_plus_one.kumo");
+    let bytecode_path = temp_dir.join(format!(
+        "test_{}_{:?}.kumo",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+        std::thread::current().id()
+    ));
     let mut file = File::create(&bytecode_path).expect("failed to create temp file");
     file.write_all(&bytecode).expect("failed to write bytecode");
 
@@ -57,6 +61,40 @@ fn test_one_plus_one() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let result = stdout.trim();
 
-    // assert result
-    assert_eq!(result, "2");
+    assert_eq!(result, expected_result);
+}
+
+#[test]
+fn test_one_plus_one() {
+    run_test("1 + 1", "2");
+}
+
+#[test]
+fn test_subtraction() {
+    run_test("1 - 1", "0");
+    run_test("10 - 5", "5");
+}
+
+#[test]
+fn test_multiplication() {
+    run_test("2 * 3", "6");
+    run_test("5 * 5", "25");
+}
+
+#[test]
+fn test_division() {
+    run_test("6 / 2", "3");
+    run_test("10 / 2", "5");
+}
+
+#[test]
+fn test_modulo() {
+    run_test("5 % 2", "1");
+    run_test("10 % 3", "1");
+}
+
+#[test]
+fn test_complex_expression() {
+    run_test("1 + 2 * 3", "7");
+    run_test("(1 + 2) * 3", "9");
 }

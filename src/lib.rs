@@ -391,6 +391,7 @@ impl<'a> Compiler<'a> {
                 self.emit_op(Operation::LoadVar(ident.sym.to_string()));
             }
             Expr::Bin(bin_expr) => self.compile_bin_expr(bin_expr),
+            Expr::Paren(paren_expr) => self.compile_expr(&paren_expr.expr),
             _ => {
                 println!("expression unimplemented:");
                 println!("span={:?}", expr.type_id());
