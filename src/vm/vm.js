@@ -33,6 +33,15 @@ class VM {
         // init call stack with main function
         this.callStack = [new StackFrame(this.functions[0])];
         this.bytecode = this.functions[0].code;
+
+        // infer global
+        if (typeof window !== 'undefined') {
+            this.global = window;
+        } else if (typeof global !== 'undefined') {
+            this.global = global;
+        } else {
+            this.global = {};
+        }
     }
 
     log(...data) {
@@ -69,6 +78,7 @@ class VM {
     }
 
     readString() {
+        this.ip++; // Advance past the opcode or previous null terminator
         const stringBytes = [];
         while (this.ip < this.bytecode.length && this.bytecode[this.ip] !== 0x00) {
             stringBytes.push(this.bytecode[this.ip]);
@@ -130,7 +140,7 @@ class VM {
                 // Operation::Regex(_, _) => 0x06,
                 case 0x06: {
                     const exp = this.readString();
-                    this.ip++; // skip null terminator
+                    // this.ip++; // skip null terminator - handled by readString for the next read
                     const flags = this.readString();
                     this.push(new RegExp(exp, flags));
                     this.log(`OP_REGEX exp=${exp} flags=${flags}`);
@@ -165,7 +175,12 @@ class VM {
                 // Operation::LoadVar(_) => 0x0a,
                 case 0x0a: {
                     const varName = this.readString();
-                    const value = this[varName];
+                    let value;
+                    if (Object.prototype.hasOwnProperty.call(this, varName)) {
+                        value = this[varName];
+                    } else if (varName in this.global) {
+                        value = this.global[varName];
+                    }
                     this.push(value);
                     this.log(`OP_LOAD_VAR ${varName} =`, value);
                     break;
@@ -203,17 +218,32 @@ class VM {
                 }
                 // Operation::Call => 0x0f,
                 case 0x0f: {
-                    const funcIndex = this.readUInt16();
-                    const func = this.functions[funcIndex];
-                    this.callStack.push(new StackFrame(func));
-                    this.bytecode = func.code;
-                    this.ip = -1; // will be incremented to 0 at the top of the loop
-                    this.log("OP_CALL function index", funcIndex);
+                    const argCount = this.pop();
+                    const args = [];
+                    for (let i = 0; i < argCount; i++) {
+                        args.push(this.pop());
+                    }
+                    args.reverse(); // Stack is LIFO, so args are popped in reverse order
+                    const func = this.pop();
+
+                    if (func instanceof VirtualFunction) {
+                        // TODO: Handle arguments for virtual functions
+                        this.callStack.push(new StackFrame(func));
+                        this.bytecode = func.code;
+                        this.ip = -1;
+                        this.log("OP_CALL virtual function");
+                    } else if (typeof func === 'function') {
+                        const result = func.apply(this.global, args);
+                        this.push(result);
+                        this.log("OP_CALL native function", result);
+                    } else {
+                        throw new Error(`Attempted to call non-function: ${func}`);
+                    }
                     break;
                 }
                 // Operation::GetProperty => 0x10,
                 case 0x10: {
-                    const propName = this.readString();
+                    const propName = this.pop();
                     const obj = this.pop();
                     const value = obj[propName];
                     this.push(value);
@@ -472,6 +502,62 @@ class VM {
                     this.log(`OP_SET_LOCAL index=${localIndex} stackBase=${frame.stackBase} value=`, value);
                     break;
                 }
+                // Operation::UnaryMinus => 0x2d,
+                case 0x2d: {
+                    const a = this.pop();
+                    const result = -a;
+                    this.push(result);
+                    this.log(`OP_UNARY_MINUS -${a} =>`, result);
+                    break;
+                }
+                // Operation::UnaryPlus => 0x2e,
+                case 0x2e: {
+                    const a = this.pop();
+                    const result = +a;
+                    this.push(result);
+                    this.log(`OP_UNARY_PLUS +${a} =>`, result);
+                    break;
+                }
+                // Operation::LogicalNot => 0x2f,
+                case 0x2f: {
+                    const a = this.pop();
+                    const result = !a;
+                    this.push(result);
+                    this.log(`OP_LOGICAL_NOT !${a} =>`, result);
+                    break;
+                }
+                // Operation::BitwiseNot => 0x30,
+                case 0x30: {
+                    const a = this.pop();
+                    const result = ~a;
+                    this.push(result);
+                    this.log(`OP_BITWISE_NOT ~${a} =>`, result);
+                    break;
+                }
+                // Operation::TypeOf => 0x31,
+                case 0x31: {
+                    const a = this.pop();
+                    const result = typeof a;
+                    this.push(result);
+                    this.log(`OP_TYPEOF typeof ${a} =>`, result);
+                    break;
+                }
+                // Operation::Void => 0x32,
+                case 0x32: {
+                    this.pop();
+                    this.push(undefined);
+                    this.log(`OP_VOID => undefined`);
+                    break;
+                }
+                // Operation::Delete => 0x33,
+                case 0x33: {
+                    const propName = this.pop();
+                    const obj = this.pop();
+                    const result = delete obj[propName];
+                    this.push(result);
+                    this.log(`OP_DELETE delete ${propName} from`, obj, '=>', result);
+                    break;
+                }
                 default: {
                     this.log("Unknown opcode: " + op);
                     return;
@@ -483,5 +569,5 @@ class VM {
 }
 
 if (typeof module !== 'undefined' && module.exports) {
-    module.exports = { VM, VirtualFunction, StackFrame };
+    module.exports = { VM };
 }

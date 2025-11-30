@@ -6,8 +6,8 @@ use swc_common::errors::{ColorConfig, Handler};
 use swc_common::sync::Lrc;
 use swc_common::SourceMap;
 use swc_ecma_ast::{
-    BinExpr, BinaryOp, CallExpr, Expr, FnDecl, Lit, MemberExpr, Module, ModuleItem, Pat, Stmt,
-    VarDecl, VarDeclarator,
+    BinExpr, BinaryOp, CallExpr, Callee, Expr, FnDecl, Lit, MemberExpr, Module, ModuleItem, Pat,
+    Stmt, VarDecl, VarDeclarator,
 };
 use swc_ecma_parser::{lexer::Lexer, Parser, StringInput, Syntax};
 use swc_ecma_visit::{Visit, VisitWith};
@@ -131,6 +131,20 @@ enum Operation {
     GetLocal(u8),
     /// Set local variable at stack offset
     SetLocal(u8),
+    /// `-`
+    UnaryMinus,
+    /// `+`
+    UnaryPlus,
+    /// `!`
+    LogicalNot,
+    /// `~`
+    BitwiseNot,
+    /// `typeof`
+    TypeOf,
+    /// `void`
+    Void,
+    /// `delete`
+    Delete,
 }
 
 impl Operation {
@@ -180,6 +194,13 @@ impl Operation {
             Operation::NullishCoalescing => 0x2a,
             Operation::GetLocal(_) => 0x2b,
             Operation::SetLocal(_) => 0x2c,
+            Operation::UnaryMinus => 0x2d,
+            Operation::UnaryPlus => 0x2e,
+            Operation::LogicalNot => 0x2f,
+            Operation::BitwiseNot => 0x30,
+            Operation::TypeOf => 0x31,
+            Operation::Void => 0x32,
+            Operation::Delete => 0x33,
         }
     }
 
@@ -229,6 +250,13 @@ impl Operation {
             Operation::NullishCoalescing => "OP_NULLISH_COALESCING",
             Operation::GetLocal(_) => "OP_GET_LOCAL",
             Operation::SetLocal(_) => "OP_SET_LOCAL",
+            Operation::UnaryMinus => "OP_UNARY_MINUS",
+            Operation::UnaryPlus => "OP_UNARY_PLUS",
+            Operation::LogicalNot => "OP_LOGICAL_NOT",
+            Operation::BitwiseNot => "OP_BITWISE_NOT",
+            Operation::TypeOf => "OP_TYPEOF",
+            Operation::Void => "OP_VOID",
+            Operation::Delete => "OP_DELETE",
         }
     }
 }
@@ -405,8 +433,12 @@ impl<'a> Compiler<'a> {
 
     fn compile_call(&mut self, expr: &CallExpr) {
         // push function onto stack
-        // callee
-        // push "this" onto stack
+        match &expr.callee {
+            Callee::Expr(callee_expr) => {
+                self.compile_expr(callee_expr);
+            }
+            _ => unimplemented!("Super and Import calls not supported"),
+        }
 
         // push args onto stack
         for arg in &expr.args {
@@ -421,9 +453,7 @@ impl<'a> Compiler<'a> {
 
     fn compile_member_expr(&mut self, member_expr: &MemberExpr) {
         self.compile_expr(&member_expr.obj);
-        // TODO: support these member expr cases
-        // if member_expr.prop.is_private_name()
-        // if member_expr.prop.is_ident()
+
         if member_expr.prop.is_computed() {
             match member_expr.prop.as_computed() {
                 Some(computed_prop_name) => {
@@ -431,6 +461,9 @@ impl<'a> Compiler<'a> {
                 }
                 None => {}
             }
+        } else if member_expr.prop.is_ident() {
+            let name = member_expr.prop.as_ident().unwrap().sym.to_string();
+            self.emit_op(Operation::LoadString(name));
         }
 
         self.emit_op(Operation::GetProperty);
@@ -450,6 +483,7 @@ impl<'a> Compiler<'a> {
                 }
             }
             Expr::Bin(bin_expr) => self.compile_bin_expr(bin_expr),
+            Expr::Unary(unary_expr) => self.compile_unary_expr(unary_expr),
             Expr::Paren(paren_expr) => self.compile_expr(&paren_expr.expr),
             _ => {
                 println!("expression unimplemented:");
@@ -488,6 +522,19 @@ impl<'a> Compiler<'a> {
             BinaryOp::LogicalOr => self.emit_op(Operation::LogicalOr),
             BinaryOp::Exp => self.emit_op(Operation::Exp),
             BinaryOp::NullishCoalescing => self.emit_op(Operation::NullishCoalescing),
+        }
+    }
+
+    fn compile_unary_expr(&mut self, expr: &swc_ecma_ast::UnaryExpr) {
+        self.compile_expr(&expr.arg);
+        match expr.op {
+            swc_ecma_ast::UnaryOp::Minus => self.emit_op(Operation::UnaryMinus),
+            swc_ecma_ast::UnaryOp::Plus => self.emit_op(Operation::UnaryPlus),
+            swc_ecma_ast::UnaryOp::Bang => self.emit_op(Operation::LogicalNot),
+            swc_ecma_ast::UnaryOp::Tilde => self.emit_op(Operation::BitwiseNot),
+            swc_ecma_ast::UnaryOp::TypeOf => self.emit_op(Operation::TypeOf),
+            swc_ecma_ast::UnaryOp::Void => self.emit_op(Operation::Void),
+            swc_ecma_ast::UnaryOp::Delete => self.emit_op(Operation::Delete),
         }
     }
 

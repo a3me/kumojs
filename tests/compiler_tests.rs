@@ -216,3 +216,46 @@ fn test_expression_statement_pop() {
     run_test("1 + 1; let x = 5; x", "5");
     run_test("10; 20; let y = 3; y", "3");
 }
+
+#[test]
+fn test_console_log() {
+    // console.log(5) prints "5" to stdout
+    // The expression returns undefined
+    // test_runner.js prints the return value (undefined)
+    // So we expect "5\nundefined"
+    run_test("let x = 5; console.log(x)", "5\nundefined");
+}
+
+#[test]
+fn test_property_access() {
+    // Math.PI is a property on the global Math object
+    // We can't easily test console properties as they are functions
+    // But we can test Math.PI if it exists in Node global
+    // Node has global.Math
+    run_test("Math.PI", "3.141592653589793");
+}
+
+#[test]
+fn test_global_shadowing() {
+    // Shadow global console with local variable
+    run_test("let console = 10; console", "10");
+}
+
+#[test]
+fn test_nested_property_access() {
+    // Test accessing a property of a property and calling it
+    // Math.max(1, 2)
+    run_test("Math.max(1, 2)", "2");
+}
+
+#[test]
+fn test_unary_operations() {
+    run_test("-5", "-5");
+    run_test("+5", "5");
+    run_test("!true", "false");
+    run_test("!false", "true");
+    run_test("~5", "-6");
+    run_test("typeof 5", "number");
+    run_test("typeof 'hello'", "string");
+    run_test("void 0", "undefined");
+}
