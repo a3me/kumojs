@@ -15,9 +15,9 @@ virtualized obfuscation is a growing trend in javascript obfuscation, and kumojs
     - [] const
     - [] let
 - [] closures / scope
-- [] unary operators
+- [x] unary operators
 - [] ternary operators
-- [] binary operators
+- [x] binary operators
 - [] arrays
 - [] objects
 - [] functions
