@@ -259,3 +259,44 @@ fn test_unary_operations() {
     run_test("typeof 'hello'", "string");
     run_test("void 0", "undefined");
 }
+
+#[test]
+fn test_assignment() {
+    run_test("let x = 1; x = 2; x", "2");
+    run_test("let x = 1; let y = (x = 2); y", "2");
+}
+
+#[test]
+fn test_array_literal() {
+    run_test("let arr = [1, 2, 3]; arr[0]", "1");
+    run_test("let arr = [1, 2, 3]; arr[1]", "2");
+    run_test("let arr = [1, 2, 3]; arr[2]", "3");
+}
+
+#[test]
+fn test_object_literal() {
+    run_test("let obj = {a: 1, b: 2}; obj.a", "1");
+    run_test("let obj = {a: 1, b: 2}; obj.b", "2");
+}
+
+#[test]
+fn test_array_destructuring() {
+    run_test("let x, y; [x, y] = [1, 2]; x", "1");
+    run_test("let x, y; [x, y] = [1, 2]; y", "2");
+}
+
+#[test]
+fn test_compound_assignment() {
+    run_test("let x = 5; x += 3; x", "8");
+    run_test("let x = 10; x -= 3; x", "7");
+    run_test("let x = 4; x *= 2; x", "8");
+    run_test("let x = 10; x /= 2; x", "5");
+    run_test("let x = 10; x %= 3; x", "1");
+}
+
+#[test]
+fn test_property_assignment() {
+    run_test("let obj = {a: 1}; obj.a = 5; obj.a", "5");
+    run_test("let obj = {a: 1}; obj.b = 10; obj.b", "10");
+    run_test("let arr = [1, 2, 3]; arr[0] = 10; arr[0]", "10");
+}

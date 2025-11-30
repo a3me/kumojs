@@ -167,7 +167,7 @@ class VM {
                 // Operation:: StoreVar(_) => 0x09,
                 case 0x09: {
                     const varName = this.readString();
-                    const value = this.pop();
+                    const value = this.peek();
                     this[varName] = value;
                     this.log(`OP_STORE_VAR ${varName} =`, value);
                     break;
@@ -252,10 +252,11 @@ class VM {
                 }
                 // Operation::SetProperty => 0x11,
                 case 0x11: {
-                    const propName = this.readString();
                     const value = this.pop();
+                    const propName = this.pop();
                     const obj = this.pop();
                     obj[propName] = value;
+                    this.push(value); // SetProperty is an expression that returns the value
                     this.log(`OP_SET_PROPERTY ${propName} =`, value);
                     break;
                 }
@@ -556,6 +557,38 @@ class VM {
                     const result = delete obj[propName];
                     this.push(result);
                     this.log(`OP_DELETE delete ${propName} from`, obj, '=>', result);
+                    break;
+                }
+                // Operation::Array(_) => 0x34,
+                case 0x34: {
+                    const count = this.readUInt32();
+                    const arr = [];
+                    for (let i = 0; i < count; i++) {
+                        arr.push(this.pop());
+                    }
+                    arr.reverse(); // Stack is LIFO, so reverse to get correct order
+                    this.push(arr);
+                    this.log(`OP_ARRAY count=${count}`, arr);
+                    break;
+                }
+                // Operation::Object(_) => 0x35,
+                case 0x35: {
+                    const count = this.readUInt32();
+                    const obj = {};
+                    for (let i = 0; i < count; i++) {
+                        const value = this.pop();
+                        const key = this.pop();
+                        obj[key] = value;
+                    }
+                    this.push(obj);
+                    this.log(`OP_OBJECT count=${count}`, obj);
+                    break;
+                }
+                // Operation::Dup => 0x36,
+                case 0x36: {
+                    const value = this.peek();
+                    this.push(value);
+                    this.log(`OP_DUP`, value);
                     break;
                 }
                 default: {

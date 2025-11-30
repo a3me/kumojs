@@ -6,8 +6,9 @@ use swc_common::errors::{ColorConfig, Handler};
 use swc_common::sync::Lrc;
 use swc_common::SourceMap;
 use swc_ecma_ast::{
-    BinExpr, BinaryOp, CallExpr, Callee, Expr, FnDecl, Lit, MemberExpr, Module, ModuleItem, Pat,
-    Stmt, VarDecl, VarDeclarator,
+    ArrayLit, ArrayPat, AssignExpr, AssignOp, AssignTarget, AssignTargetPat, BinExpr, BinaryOp,
+    CallExpr, Callee, Expr, FnDecl, Lit, MemberExpr, Module, ModuleItem, ObjectLit, Pat, Prop,
+    PropName, PropOrSpread, SimpleAssignTarget, Stmt, UnaryExpr, UnaryOp, VarDecl, VarDeclarator,
 };
 use swc_ecma_parser::{lexer::Lexer, Parser, StringInput, Syntax};
 use swc_ecma_visit::{Visit, VisitWith};
@@ -145,6 +146,12 @@ enum Operation {
     Void,
     /// `delete`
     Delete,
+    /// Create array with n elements
+    Array(u32),
+    /// Create object with n properties
+    Object(u32),
+    /// Duplicate the top value on the stack
+    Dup,
 }
 
 impl Operation {
@@ -201,6 +208,9 @@ impl Operation {
             Operation::TypeOf => 0x31,
             Operation::Void => 0x32,
             Operation::Delete => 0x33,
+            Operation::Array(_) => 0x34,
+            Operation::Object(_) => 0x35,
+            Operation::Dup => 0x36,
         }
     }
 
@@ -257,6 +267,9 @@ impl Operation {
             Operation::TypeOf => "OP_TYPEOF",
             Operation::Void => "OP_VOID",
             Operation::Delete => "OP_DELETE",
+            Operation::Array(_) => "OP_ARRAY",
+            Operation::Object(_) => "OP_OBJECT",
+            Operation::Dup => "OP_DUP",
         }
     }
 }
@@ -485,12 +498,210 @@ impl<'a> Compiler<'a> {
             Expr::Bin(bin_expr) => self.compile_bin_expr(bin_expr),
             Expr::Unary(unary_expr) => self.compile_unary_expr(unary_expr),
             Expr::Paren(paren_expr) => self.compile_expr(&paren_expr.expr),
+            Expr::Assign(assign_expr) => self.compiler_assign_expr(assign_expr),
+            Expr::Array(array_lit) => self.compile_array_lit(array_lit),
+            Expr::Object(object_lit) => self.compile_object_lit(object_lit),
             _ => {
                 println!("expression unimplemented:");
                 println!("span={:?}", expr.type_id());
             }
         }
         // self.emit_op(Operation::Pop);
+    }
+
+    fn compiler_assign_expr(&mut self, expr: &AssignExpr) {
+        match &expr.op {
+            AssignOp::Assign => {
+                // For member assignment, we need special handling
+                match &expr.left {
+                    AssignTarget::Simple(SimpleAssignTarget::Member(member_expr)) => {
+                        // For obj.prop = value
+                        // Need stack: [obj, propName, value]
+
+                        // Compile the object
+                        self.compile_expr(&member_expr.obj);
+
+                        // Compile the property name
+                        if member_expr.prop.is_computed() {
+                            match member_expr.prop.as_computed() {
+                                Some(computed_prop_name) => {
+                                    self.compile_expr(&computed_prop_name.expr);
+                                }
+                                None => {}
+                            }
+                        } else if member_expr.prop.is_ident() {
+                            let name = member_expr.prop.as_ident().unwrap().sym.to_string();
+                            self.emit_op(Operation::LoadString(name));
+                        }
+
+                        // Compile the RHS value
+                        self.compile_expr(&expr.right);
+
+                        self.emit_op(Operation::SetProperty);
+                    }
+                    _ => {
+                        // For other assignments, compile RHS first, then assign
+                        self.compile_expr(&expr.right);
+                        self.assign_to_target(&expr.left);
+                    }
+                }
+            }
+            _ => {
+                // For compound assignments
+                self.compile_compound_assign(expr);
+            }
+        }
+    }
+
+    fn assign_to_target(&mut self, target: &AssignTarget) {
+        match target {
+            AssignTarget::Simple(simple_target) => match simple_target {
+                SimpleAssignTarget::Ident(ident) => {
+                    let name = ident.id.sym.to_string();
+                    if let Some(index) = self.resolve_local(&name) {
+                        self.emit_op(Operation::SetLocal(index));
+                    } else {
+                        self.emit_op(Operation::StoreVar(name));
+                    }
+                }
+                _ => unimplemented!("assignment to this target not supported yet"),
+            },
+            AssignTarget::Pat(pat) => match pat {
+                AssignTargetPat::Array(array_pat) => {
+                    self.compile_array_destructuring(array_pat);
+                }
+                _ => unimplemented!("assignment to this pattern not supported yet"),
+            },
+        }
+    }
+
+    fn compile_compound_assign(&mut self, expr: &AssignExpr) {
+        // Only supporting simple identifiers for now
+        match &expr.left {
+            AssignTarget::Simple(SimpleAssignTarget::Ident(ident)) => {
+                let name = ident.id.sym.to_string();
+
+                // Load current value
+                if let Some(index) = self.resolve_local(&name) {
+                    self.emit_op(Operation::GetLocal(index));
+                } else {
+                    self.emit_op(Operation::LoadVar(name.clone()));
+                }
+
+                // Compile RHS
+                self.compile_expr(&expr.right);
+
+                // Perform operation
+                match expr.op {
+                    AssignOp::AddAssign => self.emit_op(Operation::Add),
+                    AssignOp::SubAssign => self.emit_op(Operation::Sub),
+                    AssignOp::MulAssign => self.emit_op(Operation::Mul),
+                    AssignOp::DivAssign => self.emit_op(Operation::Div),
+                    AssignOp::ModAssign => self.emit_op(Operation::Mod),
+                    AssignOp::LShiftAssign => self.emit_op(Operation::LShift),
+                    AssignOp::RShiftAssign => self.emit_op(Operation::RShift),
+                    AssignOp::ZeroFillRShiftAssign => self.emit_op(Operation::ZeroFillRShift),
+                    AssignOp::BitOrAssign => self.emit_op(Operation::BitOr),
+                    AssignOp::BitXorAssign => self.emit_op(Operation::BitXor),
+                    AssignOp::BitAndAssign => self.emit_op(Operation::BitAnd),
+                    AssignOp::ExpAssign => self.emit_op(Operation::Exp),
+                    AssignOp::AndAssign => self.emit_op(Operation::LogicalAnd),
+                    AssignOp::OrAssign => self.emit_op(Operation::LogicalOr),
+                    AssignOp::NullishAssign => self.emit_op(Operation::NullishCoalescing),
+                    _ => unreachable!(),
+                }
+
+                // Store result
+                if let Some(index) = self.resolve_local(&name) {
+                    self.emit_op(Operation::SetLocal(index));
+                } else {
+                    self.emit_op(Operation::StoreVar(name));
+                }
+            }
+            _ => unimplemented!("compound assignment to complex targets not supported yet"),
+        }
+    }
+
+    fn compile_array_lit(&mut self, array_lit: &ArrayLit) {
+        for elem in &array_lit.elems {
+            match elem {
+                Some(expr_or_spread) => {
+                    self.compile_expr(&expr_or_spread.expr);
+                }
+                None => self.emit_op(Operation::Undefined),
+            }
+        }
+        self.emit_op(Operation::Array(array_lit.elems.len() as u32));
+    }
+
+    fn compile_object_lit(&mut self, object_lit: &ObjectLit) {
+        for prop in &object_lit.props {
+            match prop {
+                PropOrSpread::Prop(prop) => {
+                    match &**prop {
+                        Prop::KeyValue(key_value) => {
+                            // Key
+                            match &key_value.key {
+                                PropName::Ident(ident) => {
+                                    self.emit_op(Operation::LoadString(ident.sym.to_string()));
+                                }
+                                PropName::Str(s) => {
+                                    self.emit_op(Operation::LoadString(s.value.to_string()));
+                                }
+                                PropName::Num(n) => {
+                                    self.emit_op(Operation::LoadString(n.value.to_string()));
+                                }
+                                PropName::Computed(computed) => {
+                                    self.compile_expr(&computed.expr);
+                                }
+                                _ => unimplemented!("object key type not supported"),
+                            }
+                            // Value
+                            self.compile_expr(&key_value.value);
+                        }
+                        _ => unimplemented!("object property type not supported"),
+                    }
+                }
+                PropOrSpread::Spread(_) => unimplemented!("spread in object not supported"),
+            }
+        }
+        self.emit_op(Operation::Object(object_lit.props.len() as u32));
+    }
+
+    fn compile_array_destructuring(&mut self, array_pat: &ArrayPat) {
+        // The value to destructure is on top of the stack
+        // We need to extract each element and assign it to the corresponding variable
+        for (i, elem) in array_pat.elems.iter().enumerate() {
+            if let Some(pat) = elem {
+                // Duplicate the array on the stack (we'll need it for each element)
+                if i < array_pat.elems.len() - 1 {
+                    self.emit_op(Operation::Dup);
+                }
+
+                // Load the index
+                self.emit_op(Operation::LoadFloat64(i as f64));
+
+                // Get the property (array[i])
+                self.emit_op(Operation::GetProperty);
+
+                // Assign to the pattern
+                match pat {
+                    Pat::Ident(ident) => {
+                        let name = ident.id.sym.to_string();
+                        if let Some(index) = self.resolve_local(&name) {
+                            self.emit_op(Operation::SetLocal(index));
+                        } else {
+                            self.emit_op(Operation::StoreVar(name));
+                        }
+                        // Pop the result of the assignment
+                        if i < array_pat.elems.len() - 1 {
+                            self.emit_op(Operation::Pop);
+                        }
+                    }
+                    _ => unimplemented!("destructuring pattern not supported"),
+                }
+            }
+        }
     }
 
     fn compile_bin_expr(&mut self, expr: &BinExpr) {
@@ -525,16 +736,16 @@ impl<'a> Compiler<'a> {
         }
     }
 
-    fn compile_unary_expr(&mut self, expr: &swc_ecma_ast::UnaryExpr) {
+    fn compile_unary_expr(&mut self, expr: &UnaryExpr) {
         self.compile_expr(&expr.arg);
         match expr.op {
-            swc_ecma_ast::UnaryOp::Minus => self.emit_op(Operation::UnaryMinus),
-            swc_ecma_ast::UnaryOp::Plus => self.emit_op(Operation::UnaryPlus),
-            swc_ecma_ast::UnaryOp::Bang => self.emit_op(Operation::LogicalNot),
-            swc_ecma_ast::UnaryOp::Tilde => self.emit_op(Operation::BitwiseNot),
-            swc_ecma_ast::UnaryOp::TypeOf => self.emit_op(Operation::TypeOf),
-            swc_ecma_ast::UnaryOp::Void => self.emit_op(Operation::Void),
-            swc_ecma_ast::UnaryOp::Delete => self.emit_op(Operation::Delete),
+            UnaryOp::Minus => self.emit_op(Operation::UnaryMinus),
+            UnaryOp::Plus => self.emit_op(Operation::UnaryPlus),
+            UnaryOp::Bang => self.emit_op(Operation::LogicalNot),
+            UnaryOp::Tilde => self.emit_op(Operation::BitwiseNot),
+            UnaryOp::TypeOf => self.emit_op(Operation::TypeOf),
+            UnaryOp::Void => self.emit_op(Operation::Void),
+            UnaryOp::Delete => self.emit_op(Operation::Delete),
         }
     }
 
@@ -597,6 +808,14 @@ impl<'a> Compiler<'a> {
             }
             Operation::SetLocal(index) => {
                 self.bytecode.push(index);
+            }
+            Operation::Array(n) => {
+                let bytes = n.to_le_bytes();
+                self.bytecode.extend_from_slice(&bytes);
+            }
+            Operation::Object(n) => {
+                let bytes = n.to_le_bytes();
+                self.bytecode.extend_from_slice(&bytes);
             }
             _ => {}
         }
