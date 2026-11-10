@@ -88,7 +88,7 @@
             debug: true,
             debugLog: (...data) => {
                 const logEntry = document.createElement("div");
-                logEntry.textContent = data.map(d => (typeof d === 'object' ? JSON.stringify(d) : d)).join(' ');
+                logEntry.textContent = data.map(d => (d !== window && typeof d === 'object' ? JSON.stringify(d) : d)).join(' ');
                 outputDiv.appendChild(logEntry);
             }
         });

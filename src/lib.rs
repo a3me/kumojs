@@ -152,6 +152,12 @@ enum Operation {
     Object(u32),
     /// Duplicate the top value on the stack
     Dup,
+    /// Create a virtual function: arity, name_len, name, code_len, code
+    Function(u8, String, Vec<u8>),
+    /// Get variable from enclosing scope: depth, index
+    GetUpvalue(u8, u8),
+    /// Set variable in enclosing scope: depth, index
+    SetUpvalue(u8, u8),
 }
 
 impl Operation {
@@ -211,6 +217,9 @@ impl Operation {
             Operation::Array(_) => 0x34,
             Operation::Object(_) => 0x35,
             Operation::Dup => 0x36,
+            Operation::Function(_, _, _) => 0x37,
+            Operation::GetUpvalue(_, _) => 0x38,
+            Operation::SetUpvalue(_, _) => 0x39,
         }
     }
 
@@ -270,6 +279,9 @@ impl Operation {
             Operation::Array(_) => "OP_ARRAY",
             Operation::Object(_) => "OP_OBJECT",
             Operation::Dup => "OP_DUP",
+            Operation::Function(_, _, _) => "OP_FUNCTION",
+            Operation::GetUpvalue(_, _) => "OP_GET_UPVALUE",
+            Operation::SetUpvalue(_, _) => "OP_SET_UPVALUE",
         }
     }
 }
@@ -288,14 +300,14 @@ impl<'a> Compiler<'a> {
         }
     }
 
-    fn new_enclosing(&'a self) -> Compiler<'a> {
+    fn new_enclosing(enclosing: &'a Compiler<'a>) -> Compiler<'a> {
         Compiler {
             bytecode: Vec::new(),
             scope: HashMap::new(),
             local_count: 0,
             locals: [LOCAL_REPEAT_VALUE; 256],
-            current_scope_depth: self.current_scope_depth + 1,
-            enclosing: None,
+            current_scope_depth: 0,
+            enclosing: Some(enclosing),
         }
     }
 
@@ -368,9 +380,22 @@ impl<'a> Compiler<'a> {
                     self.emit_op(Operation::Pop);
                 }
             }
+            Stmt::Return(return_stmt) => {
+                if let Some(arg) = &return_stmt.arg {
+                    self.compile_expr(arg);
+                } else {
+                    self.emit_op(Operation::Undefined);
+                }
+                self.emit_op(Operation::Return);
+            }
             Stmt::Decl(decl) => {
                 // handle declarations (variable, function, etc.)
-                decl.visit_with(self);
+                match decl {
+                    swc_ecma_ast::Decl::Fn(fn_decl) => {
+                        self.compile_fn_decl(fn_decl);
+                    }
+                    _ => decl.visit_with(self),
+                }
             }
             Stmt::Block(block_stmt) => {
                 for stmt in &block_stmt.stmts {
@@ -406,15 +431,22 @@ impl<'a> Compiler<'a> {
         self.add_local(name, self.current_scope_depth)
     }
 
-    fn resolve_local(&self, name: &str) -> Option<u8> {
+    fn resolve_local(&self, name: &str) -> Option<(u8, u8)> {
         // search locals array backwards (most recent first)
         for i in (0..self.local_count).rev() {
             if let Some(ref local) = self.locals[i] {
-                if local.name == name && local.depth <= self.current_scope_depth {
-                    return Some(i as u8);
+                if local.name == name {
+                    return Some((0, i as u8));
                 }
             }
         }
+
+        if let Some(enclosing) = self.enclosing {
+            if let Some((depth, index)) = enclosing.resolve_local(name) {
+                return Some((depth + 1, index));
+            }
+        }
+
         None
     }
 
@@ -425,6 +457,52 @@ impl<'a> Compiler<'a> {
         }
     }
 
+    fn compile_fn_decl(&mut self, fn_decl: &FnDecl) {
+        let name = fn_decl.ident.sym.to_string();
+
+        // compile function body in a new compiler instance
+        let mut fn_compiler = Compiler::new_enclosing(self);
+
+        // add parameters as locals
+        for param in &fn_decl.function.params {
+            match &param.pat {
+                Pat::Ident(ident) => {
+                    fn_compiler.declare_variable(ident.id.sym.to_string());
+                }
+                _ => unimplemented!("Complex parameters not supported"),
+            }
+        }
+
+        // compile body
+        if let Some(body) = &fn_decl.function.body {
+            for stmt in &body.stmts {
+                fn_compiler.compile_stmt(stmt, false);
+            }
+        }
+
+        // ensure implicit return undefined if no return statement
+        fn_compiler.emit_op(Operation::Undefined);
+        fn_compiler.emit_op(Operation::Return);
+
+        let code = fn_compiler.bytecode;
+        let arity = fn_decl.function.params.len() as u8;
+
+        self.emit_op(Operation::Function(arity, name.clone(), code));
+
+        // store the function in the current scope
+        self.declare_variable(name.clone());
+        if let Some((depth, index)) = self.resolve_local(&name) {
+            if depth == 0 {
+                self.emit_op(Operation::SetLocal(index));
+            } else {
+                // should not happen for declaration in current scope
+                unreachable!();
+            }
+        } else {
+            self.emit_op(Operation::StoreVar(name));
+        }
+    }
+
     fn compile_var_declator(&mut self, var_declator: &VarDeclarator) {
         match var_declator.init {
             Some(ref init) => self.compile_expr(init),
@@ -432,8 +510,18 @@ impl<'a> Compiler<'a> {
         }
         match &var_declator.name {
             Pat::Ident(name) => {
-                println!("var ident: {:?}", name.id.sym.to_string());
-                self.declare_variable(name.id.sym.to_string());
+                let name_str = name.id.sym.to_string();
+                self.declare_variable(name_str.clone());
+                if let Some((depth, index)) = self.resolve_local(&name_str) {
+                    if depth == 0 {
+                        self.emit_op(Operation::SetLocal(index));
+                    } else {
+                        unreachable!("Declared variable should be local");
+                    }
+                } else {
+                    // Should be unreachable if declare_variable works
+                    self.emit_op(Operation::StoreVar(name_str));
+                }
             }
             Pat::Array(_) => todo!(),
             Pat::Rest(_) => todo!(),
@@ -489,8 +577,12 @@ impl<'a> Compiler<'a> {
             Expr::Member(member_expr) => self.compile_member_expr(member_expr),
             Expr::Ident(ident) => {
                 let name = ident.sym.to_string();
-                if let Some(local_index) = self.resolve_local(&name) {
-                    self.emit_op(Operation::GetLocal(local_index));
+                if let Some((depth, index)) = self.resolve_local(&name) {
+                    if depth == 0 {
+                        self.emit_op(Operation::GetLocal(index));
+                    } else {
+                        self.emit_op(Operation::GetUpvalue(depth, index));
+                    }
                 } else {
                     self.emit_op(Operation::LoadVar(name));
                 }
@@ -558,8 +650,12 @@ impl<'a> Compiler<'a> {
             AssignTarget::Simple(simple_target) => match simple_target {
                 SimpleAssignTarget::Ident(ident) => {
                     let name = ident.id.sym.to_string();
-                    if let Some(index) = self.resolve_local(&name) {
-                        self.emit_op(Operation::SetLocal(index));
+                    if let Some((depth, index)) = self.resolve_local(&name) {
+                        if depth == 0 {
+                            self.emit_op(Operation::SetLocal(index));
+                        } else {
+                            self.emit_op(Operation::SetUpvalue(depth, index));
+                        }
                     } else {
                         self.emit_op(Operation::StoreVar(name));
                     }
@@ -582,8 +678,12 @@ impl<'a> Compiler<'a> {
                 let name = ident.id.sym.to_string();
 
                 // Load current value
-                if let Some(index) = self.resolve_local(&name) {
-                    self.emit_op(Operation::GetLocal(index));
+                if let Some((depth, index)) = self.resolve_local(&name) {
+                    if depth == 0 {
+                        self.emit_op(Operation::GetLocal(index));
+                    } else {
+                        self.emit_op(Operation::GetUpvalue(depth, index));
+                    }
                 } else {
                     self.emit_op(Operation::LoadVar(name.clone()));
                 }
@@ -612,8 +712,12 @@ impl<'a> Compiler<'a> {
                 }
 
                 // Store result
-                if let Some(index) = self.resolve_local(&name) {
-                    self.emit_op(Operation::SetLocal(index));
+                if let Some((depth, index)) = self.resolve_local(&name) {
+                    if depth == 0 {
+                        self.emit_op(Operation::SetLocal(index));
+                    } else {
+                        self.emit_op(Operation::SetUpvalue(depth, index));
+                    }
                 } else {
                     self.emit_op(Operation::StoreVar(name));
                 }
@@ -688,8 +792,12 @@ impl<'a> Compiler<'a> {
                 match pat {
                     Pat::Ident(ident) => {
                         let name = ident.id.sym.to_string();
-                        if let Some(index) = self.resolve_local(&name) {
-                            self.emit_op(Operation::SetLocal(index));
+                        if let Some((depth, index)) = self.resolve_local(&name) {
+                            if depth == 0 {
+                                self.emit_op(Operation::SetLocal(index));
+                            } else {
+                                self.emit_op(Operation::SetUpvalue(depth, index));
+                            }
                         } else {
                             self.emit_op(Operation::StoreVar(name));
                         }
@@ -799,8 +907,29 @@ impl<'a> Compiler<'a> {
                 self.bytecode.extend_from_slice(&bytes);
             }
             Operation::UInt64(n) => {
-                let bytes = n.to_le_bytes();
+                // can't easily emit 64-bit integers in JS, so we split into two 32-bit integers
+                let low = n as u32;
+                let high = (n >> 32) as u32;
+                let low_bytes = low.to_le_bytes();
+                let high_bytes = high.to_le_bytes();
+                self.bytecode.extend_from_slice(&low_bytes);
+                self.bytecode.extend_from_slice(&high_bytes);
+            }
+            Operation::Function(arity, name, code) => {
+                self.bytecode.push(arity);
+                self.emit_string(&name);
+                let code_len = code.len() as u32;
+                let bytes = code_len.to_le_bytes();
                 self.bytecode.extend_from_slice(&bytes);
+                self.bytecode.extend_from_slice(&code);
+            }
+            Operation::GetUpvalue(depth, index) => {
+                self.bytecode.push(depth);
+                self.bytecode.push(index);
+            }
+            Operation::SetUpvalue(depth, index) => {
+                self.bytecode.push(depth);
+                self.bytecode.push(index);
             }
             Operation::LoadVar(name) => self.emit_string(&name),
             Operation::GetLocal(index) => {
@@ -823,7 +952,7 @@ impl<'a> Compiler<'a> {
 
     fn emit_string(&mut self, s: &str) {
         self.bytecode.extend_from_slice(s.as_bytes());
-        self.bytecode.push(0x00);
+        self.bytecode.push(0);
     }
 }
 
@@ -833,11 +962,5 @@ impl Visit for Compiler<'_> {
     }
     fn visit_var_decl(&mut self, n: &VarDecl) {
         self.compile_var_decl(n);
-    }
-    fn visit_fn_decl(&mut self, n: &FnDecl) {
-        self.new_enclosing();
-        self.enter_scope();
-        n.visit_children_with(self);
-        self.exit_scope();
     }
 }

@@ -61,7 +61,15 @@ fn run_test(source: &str, expected_result: &str) {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let result = stdout.trim();
 
+    if result != expected_result {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        println!("Stderr:\n{}", stderr);
+    }
+
     assert_eq!(result, expected_result);
+
+    // cleanup
+    let _ = std::fs::remove_file(bytecode_path);
 }
 
 #[test]

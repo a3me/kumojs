@@ -1,13 +1,20 @@
 class VirtualFunction {
-    constructor(code) {
+    constructor(arity, name, code, env) {
+        this.arity = arity;
+        this.name = name;
         this.code = new Uint8Array(code);
+        this.env = env; // Closure environment (parent StackFrame)
     }
 }
 
 class StackFrame {
-    constructor(func, stackBase) {
+    constructor(func, stackBase, parent) {
         this.func = func;
-        this.stackBase = stackBase || 0;  // Index where this frame's locals start
+        this.stackBase = stackBase || 0;  // Index where this frame's operands start (for restoration)
+        this.parent = parent || null;     // Parent frame for upvalues
+        this.ip = 0;                      // Instruction pointer for this frame
+        this.locals = new Map();          // Locals for this frame (heap allocated/captured)
+        this.id = Math.random();
     }
 }
 
@@ -22,7 +29,7 @@ class VM {
         // setup virtual functions
         this.functions = [];
         for (const funcCode of bytecode) {
-            const func = new VirtualFunction(funcCode);
+            const func = new VirtualFunction(0, 'main', funcCode, null);
             this.functions.push(func);
         }
 
@@ -41,6 +48,11 @@ class VM {
             this.global = global;
         } else {
             this.global = {};
+        }
+
+        // Ensure window is available if we are in node
+        if (typeof window === 'undefined') {
+            this.global.window = this.global;
         }
     }
 
@@ -100,6 +112,8 @@ class VM {
     }
 
     run() {
+        const entryStackSize = this.callStack.length;
+
         for (; this.ip < this.bytecode.length; this.ip++) {
             // get current opcode
             const op = this.bytecode[this.ip];
@@ -154,20 +168,37 @@ class VM {
                 }
                 // Operation::Return => 0x08,
                 case 0x08: {
-                    this.callStack.pop();
+                    const frame = this.callStack.pop();
                     const returnValue = this.pop();
-                    if (this.callStack.length === 0) {
+
+                    // Clean up stack (remove operands of the returning function)
+                    // Locals are in frame.locals, so we don't need to clean them from stack
+                    this.stack.length = frame.stackBase;
+
+                    if (this.callStack.length < entryStackSize) {
                         this.log("OP_RETURN (main)", returnValue);
                         return returnValue;
                     }
+
                     this.push(returnValue);
+
+                    // Restore caller state
+                    const callerFrame = this.callStack[this.callStack.length - 1];
+                    this.bytecode = callerFrame.func.code;
+                    this.ip = callerFrame.ip;
+
                     this.log("OP_RETURN", returnValue);
-                    return returnValue;
+                    break;
                 }
                 // Operation:: StoreVar(_) => 0x09,
                 case 0x09: {
                     const varName = this.readString();
-                    const value = this.peek();
+                    let value = this.peek();
+
+                    if (value instanceof VirtualFunction) {
+                        value = this.createHostWrapper(value);
+                    }
+
                     this[varName] = value;
                     this.log(`OP_STORE_VAR ${varName} =`, value);
                     break;
@@ -226,12 +257,31 @@ class VM {
                     args.reverse(); // Stack is LIFO, so args are popped in reverse order
                     const func = this.pop();
 
-                    if (func instanceof VirtualFunction) {
-                        // TODO: Handle arguments for virtual functions
-                        this.callStack.push(new StackFrame(func));
-                        this.bytecode = func.code;
+                    let targetFunc = func;
+                    if (func && func.virtualFunction instanceof VirtualFunction) {
+                        targetFunc = func.virtualFunction;
+                    }
+
+                    if (targetFunc instanceof VirtualFunction) {
+                        const currentFrame = this.callStack[this.callStack.length - 1];
+                        currentFrame.ip = this.ip; // Save current IP
+
+                        const newStackBase = this.stack.length;
+
+                        // Create new stack frame
+                        // Parent is the function's definition environment (closure)
+                        const newFrame = new StackFrame(targetFunc, newStackBase, targetFunc.env);
+
+                        // Initialize locals with arguments
+                        newFrame.locals = new Map();
+                        for (let i = 0; i < args.length; i++) {
+                            newFrame.locals.set(i, args[i]);
+                        }
+                        this.callStack.push(newFrame);
+
+                        this.bytecode = targetFunc.code;
                         this.ip = -1;
-                        this.log("OP_CALL virtual function");
+                        this.log(`OP_CALL virtual function ${targetFunc.name} arity=${targetFunc.arity} args=${args.length}`);
                     } else if (typeof func === 'function') {
                         const result = func.apply(this.global, args);
                         this.push(result);
@@ -252,9 +302,14 @@ class VM {
                 }
                 // Operation::SetProperty => 0x11,
                 case 0x11: {
-                    const value = this.pop();
+                    let value = this.pop();
                     const propName = this.pop();
                     const obj = this.pop();
+
+                    if (value instanceof VirtualFunction) {
+                        value = this.createHostWrapper(value);
+                    }
+
                     obj[propName] = value;
                     this.push(value); // SetProperty is an expression that returns the value
                     this.log(`OP_SET_PROPERTY ${propName} =`, value);
@@ -489,9 +544,9 @@ class VM {
                 case 0x2b: {
                     const localIndex = this.readUInt8();
                     const frame = this.callStack[this.callStack.length - 1];
-                    const value = this.stack[frame.stackBase + localIndex];
+                    const value = frame.locals.get(localIndex);
                     this.push(value);
-                    this.log(`OP_GET_LOCAL index=${localIndex} stackBase=${frame.stackBase} value=`, value);
+                    this.log(`OP_GET_LOCAL index=${localIndex} value=`, value);
                     break;
                 }
                 // Operation::SetLocal(_) => 0x2c,
@@ -499,8 +554,8 @@ class VM {
                     const localIndex = this.readUInt8();
                     const value = this.peek();  // Don't pop, assignment is an expression
                     const frame = this.callStack[this.callStack.length - 1];
-                    this.stack[frame.stackBase + localIndex] = value;
-                    this.log(`OP_SET_LOCAL index=${localIndex} stackBase=${frame.stackBase} value=`, value);
+                    frame.locals.set(localIndex, value);
+                    this.log(`OP_SET_LOCAL index=${localIndex} value=`, value);
                     break;
                 }
                 // Operation::UnaryMinus => 0x2d,
@@ -591,6 +646,59 @@ class VM {
                     this.log(`OP_DUP`, value);
                     break;
                 }
+                // Operation::Function => 0x37,
+                case 0x37: {
+                    const arity = this.readUInt8();
+                    const name = this.readString();
+                    const codeLen = this.readUInt32();
+                    const code = [];
+                    for (let i = 0; i < codeLen; i++) {
+                        code.push(this.readUInt8());
+                    }
+
+                    // Capture current environment
+                    const currentFrame = this.callStack[this.callStack.length - 1];
+                    const func = new VirtualFunction(arity, name, code, currentFrame);
+                    this.push(func);
+                    this.log(`OP_FUNCTION name=${name} arity=${arity}`);
+                    break;
+                }
+                // Operation::GetUpvalue => 0x38,
+                case 0x38: {
+                    const depth = this.readUInt8();
+                    const index = this.readUInt8();
+
+                    let frame = this.callStack[this.callStack.length - 1];
+                    for (let i = 0; i < depth; i++) {
+                        frame = frame.parent;
+                        if (!frame) {
+                            throw new Error(`Invalid upvalue depth: ${depth}`);
+                        }
+                    }
+
+                    const value = frame.locals.get(index);
+                    this.push(value);
+                    this.log(`OP_GET_UPVALUE depth=${depth} index=${index} value=`, value);
+                    break;
+                }
+                // Operation::SetUpvalue => 0x39,
+                case 0x39: {
+                    const depth = this.readUInt8();
+                    const index = this.readUInt8();
+                    const value = this.peek(); // Don't pop, assignment is an expression
+
+                    let frame = this.callStack[this.callStack.length - 1];
+                    for (let i = 0; i < depth; i++) {
+                        frame = frame.parent;
+                        if (!frame) {
+                            throw new Error(`Invalid upvalue depth: ${depth}`);
+                        }
+                    }
+
+                    frame.locals.set(index, value);
+                    this.log(`OP_SET_UPVALUE depth=${depth} index=${index} value=`, value);
+                    break;
+                }
                 default: {
                     this.log("Unknown opcode: " + op);
                     return;
@@ -598,6 +706,40 @@ class VM {
             }
         }
         this.printStack();
+    }
+
+    createHostWrapper(func) {
+        const vm = this;
+        const wrapper = function (...args) {
+            // Save current state
+            const savedIp = vm.ip;
+            const savedBytecode = vm.bytecode;
+
+            // Create new stack frame
+            const newStackBase = vm.stack.length;
+            const newFrame = new StackFrame(func, newStackBase, func.env);
+            newFrame.locals = new Map();
+            for (let i = 0; i < args.length; i++) {
+                newFrame.locals.set(i, args[i]);
+            }
+            vm.callStack.push(newFrame);
+
+            // Setup VM state
+            vm.bytecode = func.code;
+            vm.ip = 0;
+
+            // Run VM
+            const result = vm.run();
+
+            // Restore state
+            vm.ip = savedIp;
+            vm.bytecode = savedBytecode;
+
+            return result;
+        };
+
+        wrapper.virtualFunction = func;
+        return wrapper;
     }
 }
 

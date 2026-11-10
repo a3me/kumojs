@@ -17,10 +17,22 @@ function main() {
         // VM expects an array of bytecodes (one for each function)
         const vm = new VM([bytecode], {
             debug: false,
-            debugLog: console.log
+            debugLog: console.error
         });
 
         vm.run();
+
+        // Execute optional verification script
+        if (args.length > 1) {
+            const verificationScript = args[1];
+            try {
+                eval(verificationScript);
+            } catch (e) {
+                console.error("Error executing verification script:", e);
+                process.exit(1);
+            }
+        }
+
         // Print the last value on the stack
         if (vm.stack.length > 0) {
             console.log(vm.stack[vm.stack.length - 1]);
