@@ -1,22 +1,24 @@
-use std::collections::HashMap;
 use std::path::Path;
 use swc_common::sync::Lrc;
 use swc_common::{SourceFile, SourceMap, Span, Spanned};
 use swc_ecma_ast::{
-    ArrayLit, ArrayPat, AssignExpr, AssignOp, AssignTarget, AssignTargetPat, BinExpr, BinaryOp,
-    CallExpr, Callee, Decl, Expr, FnDecl, Lit, MemberExpr, MemberProp, Module, ModuleItem,
-    ObjectLit, Pat, Prop, PropName, PropOrSpread, SimpleAssignTarget, Stmt, UnaryExpr, UnaryOp,
-    VarDecl, VarDeclarator,
+    ArrayLit, ArrayPat, ArrowExpr, AssignExpr, AssignOp, AssignTarget, AssignTargetPat, BinExpr,
+    BinaryOp, CallExpr, Callee, Class, Decl, Expr, FnDecl, Function, Ident, Lit, MemberExpr,
+    MemberProp, Module, ModuleItem, ObjectLit, Pat, Prop, PropName, PropOrSpread,
+    SimpleAssignTarget, Stmt, UnaryExpr, UnaryOp, VarDecl, VarDeclKind, VarDeclarator,
 };
 use swc_ecma_parser::{lexer::Lexer, Parser, StringInput, Syntax};
+use swc_ecma_visit::{Visit, VisitWith};
 use thiserror::Error;
 
 pub struct Compiler<'a> {
     bytecode: Vec<u8>,
-    local_count: usize,
-    locals: [Option<Local>; 256],
+    /// names currently in scope in this function, innermost last
+    locals: Vec<Local>,
+    /// slots used so far in this function (slots are never reused, so closures stay valid)
+    slot_count: usize,
+    /// block nesting depth within this function (0 = function body)
     current_scope_depth: usize,
-    scope: HashMap<String, usize>,
     enclosing: Option<&'a Compiler<'a>>,
 }
 
@@ -66,7 +68,28 @@ enum VirtualFunctionType {
 struct Local {
     name: String,
     depth: usize,
+    slot: u8,
 }
+
+/// Undeclared names that resolve to the host environment. Everything else must be declared.
+#[derive(Clone, Copy)]
+enum HostGlobal {
+    Window = 0,
+    GlobalThis = 1,
+}
+
+impl HostGlobal {
+    fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "window" => Some(HostGlobal::Window),
+            "globalThis" => Some(HostGlobal::GlobalThis),
+            _ => None,
+        }
+    }
+}
+
+/// `HostGlobal` operand flag: push `undefined` instead of throwing when missing (for `typeof`)
+const HOST_GLOBAL_TYPEOF: u8 = 0b10;
 
 #[derive(Debug)]
 enum Operation {
@@ -87,10 +110,6 @@ enum Operation {
     Undefined,
     ///
     Regex(String, String),
-    /// x = 1
-    StoreVar(String),
-    /// x
-    LoadVar(String),
     /// x()
     Call,
     /// x.a
@@ -171,6 +190,12 @@ enum Operation {
     GetUpvalue(u8, u8),
     /// Set variable in enclosing scope: depth, index
     SetUpvalue(u8, u8),
+    /// obj.f(): stack is [obj, f, ...args, argc]; calls f with obj as `this`
+    CallMethod,
+    /// `this`
+    This,
+    /// host `window` / `globalThis`: operand is a `HostGlobal` id, optionally | `HOST_GLOBAL_TYPEOF`
+    HostGlobal(u8),
     /// Jump forward by offset
     Jump(u32),
     /// Jump forward by offset if top of stack is falsy (does not pop)
@@ -192,8 +217,6 @@ impl Operation {
             Operation::Regex(_, _) => 0x06,
             Operation::Undefined => 0x07,
             Operation::Return => 0x08,
-            Operation::StoreVar(_) => 0x09,
-            Operation::LoadVar(_) => 0x0a,
             Operation::UInt8(_) => 0x0b,
             Operation::UInt16(_) => 0x0c,
             Operation::UInt32(_) => 0x0d,
@@ -242,6 +265,9 @@ impl Operation {
             Operation::JumpIfFalse(_) => 0x3b,
             Operation::JumpIfTrue(_) => 0x3c,
             Operation::JumpIfNotNullish(_) => 0x3d,
+            Operation::CallMethod => 0x3e,
+            Operation::This => 0x3f,
+            Operation::HostGlobal(_) => 0x40,
         }
     }
 
@@ -255,8 +281,6 @@ impl Operation {
             Operation::Null => "OP_NULL",
             Operation::Undefined => "OP_UNDEFINED",
             Operation::Regex(_, _) => "OP_REGEX",
-            Operation::StoreVar(_) => "OP_STORE_VAR",
-            Operation::LoadVar(_) => "OP_LOAD_VAR",
             Operation::UInt8(_) => "OP_UINT_8",
             Operation::UInt16(_) => "OP_UINT_16",
             Operation::UInt32(_) => "OP_UINT_32",
@@ -305,19 +329,19 @@ impl Operation {
             Operation::JumpIfFalse(_) => "OP_JUMP_IF_FALSE",
             Operation::JumpIfTrue(_) => "OP_JUMP_IF_TRUE",
             Operation::JumpIfNotNullish(_) => "OP_JUMP_IF_NOT_NULLISH",
+            Operation::CallMethod => "OP_CALL_METHOD",
+            Operation::This => "OP_THIS",
+            Operation::HostGlobal(_) => "OP_HOST_GLOBAL",
         }
     }
 }
-
-const LOCAL_REPEAT_VALUE: Option<Local> = None;
 
 impl<'a> Compiler<'a> {
     pub fn new() -> Self {
         Compiler {
             bytecode: Vec::new(),
-            local_count: 0,
-            locals: [LOCAL_REPEAT_VALUE; 256],
-            scope: HashMap::new(),
+            locals: Vec::new(),
+            slot_count: 0,
             current_scope_depth: 0,
             enclosing: None,
         }
@@ -326,9 +350,8 @@ impl<'a> Compiler<'a> {
     fn new_enclosing(enclosing: &'a Compiler<'a>) -> Compiler<'a> {
         Compiler {
             bytecode: Vec::new(),
-            scope: HashMap::new(),
-            local_count: 0,
-            locals: [LOCAL_REPEAT_VALUE; 256],
+            locals: Vec::new(),
+            slot_count: 0,
             current_scope_depth: 0,
             enclosing: Some(enclosing),
         }
@@ -381,15 +404,62 @@ impl<'a> Compiler<'a> {
     }
 
     pub fn compile(&mut self, module: &Module) -> CompileResult<Vec<u8>> {
-        let body_len = module.body.len();
-        for (i, item) in module.body.iter().enumerate() {
-            let is_last = i == body_len - 1;
+        let mut stmts = Vec::with_capacity(module.body.len());
+        for item in &module.body {
             match item {
-                ModuleItem::Stmt(stmt) => self.compile_stmt(stmt, is_last)?,
+                ModuleItem::Stmt(stmt) => stmts.push(stmt),
                 ModuleItem::ModuleDecl(decl) => return unsupported("import/export", decl.span()),
             }
         }
+        // the module body behaves like a function body
+        self.compile_body(&stmts, true, true)?;
         Ok(self.bytecode.clone())
+    }
+
+    /// Compile a list of statements forming a function body or block.
+    /// Declarations are hoisted first: `var`s (function bodies only, found anywhere in the
+    /// body), then `let`/`const` and function names of this block, then function values,
+    /// so code can refer to anything declared in scope regardless of order.
+    /// `leave_last` keeps the last expression statement's value on the stack (module body).
+    fn compile_body(&mut self, stmts: &[&Stmt], hoist_vars: bool, leave_last: bool) -> CompileResult {
+        if hoist_vars {
+            let mut names = Vec::new();
+            let mut collector = VarCollector { names: &mut names };
+            for stmt in stmts {
+                stmt.visit_with(&mut collector);
+            }
+            for name in names {
+                self.declare_if_absent(name)?;
+            }
+        }
+
+        for stmt in stmts {
+            match stmt {
+                Stmt::Decl(Decl::Var(var_decl)) if var_decl.kind != VarDeclKind::Var => {
+                    for decl in &var_decl.decls {
+                        if let Pat::Ident(ident) = &decl.name {
+                            self.declare_variable(ident.id.sym.to_string())?;
+                        }
+                    }
+                }
+                Stmt::Decl(Decl::Fn(fn_decl)) => {
+                    self.declare_if_absent(fn_decl.ident.sym.to_string())?;
+                }
+                _ => {}
+            }
+        }
+
+        for stmt in stmts {
+            if let Stmt::Decl(Decl::Fn(fn_decl)) = stmt {
+                self.compile_fn_decl(fn_decl)?;
+            }
+        }
+
+        let last = stmts.len().saturating_sub(1);
+        for (i, stmt) in stmts.iter().enumerate() {
+            self.compile_stmt(stmt, leave_last && i == last)?;
+        }
+        Ok(())
     }
 
     fn compile_stmt(&mut self, stmt: &Stmt, is_last_in_module: bool) -> CompileResult {
@@ -408,12 +478,14 @@ impl<'a> Compiler<'a> {
                 }
                 self.emit_op(Operation::Return);
             }
-            Stmt::Decl(Decl::Fn(fn_decl)) => self.compile_fn_decl(fn_decl)?,
+            // compiled when hoisted by `compile_body`
+            Stmt::Decl(Decl::Fn(_)) => {}
             Stmt::Decl(Decl::Var(var_decl)) => self.compile_var_decl(var_decl)?,
             Stmt::Block(block_stmt) => {
-                for stmt in &block_stmt.stmts {
-                    self.compile_stmt(stmt, false)?;
-                }
+                let stmts: Vec<&Stmt> = block_stmt.stmts.iter().collect();
+                self.enter_scope();
+                self.compile_body(&stmts, false, false)?;
+                self.exit_scope();
             }
             Stmt::Empty(_) => {}
             _ => return unsupported(stmt_kind(stmt), stmt.span()),
@@ -421,71 +493,103 @@ impl<'a> Compiler<'a> {
         Ok(())
     }
 
-    #[allow(dead_code)]
     fn enter_scope(&mut self) {
         self.current_scope_depth += 1;
     }
 
-    #[allow(dead_code)]
+    /// Leave a block: its names go out of scope (their slots are not reused).
     fn exit_scope(&mut self) {
         self.current_scope_depth -= 1;
+        while self
+            .locals
+            .last()
+            .is_some_and(|l| l.depth > self.current_scope_depth)
+        {
+            self.locals.pop();
+        }
     }
 
-    fn add_local(&mut self, name: String, depth: usize) -> CompileResult {
-        if self.local_count >= 256 {
+    /// Declare a name in the current block and return its new slot.
+    fn declare_variable(&mut self, name: String) -> CompileResult<u8> {
+        if self.slot_count >= 256 {
             return Err(CompileError::TooManyLocals);
         }
-        self.locals[self.local_count] = Some(Local { name, depth });
-        self.local_count += 1;
-        Ok(())
+        let slot = self.slot_count as u8;
+        self.slot_count += 1;
+        self.locals.push(Local {
+            name,
+            depth: self.current_scope_depth,
+            slot,
+        });
+        Ok(slot)
     }
 
-    /// Declare a local in the current function and return its slot.
-    fn declare_variable(&mut self, name: String) -> CompileResult<u8> {
-        self.add_local(name, self.current_scope_depth)?;
-        Ok((self.local_count - 1) as u8)
+    /// Declare a name unless the current block already has it (`var` redeclaring a param, etc).
+    fn declare_if_absent(&mut self, name: String) -> CompileResult<u8> {
+        let existing = self
+            .locals
+            .iter()
+            .rev()
+            .take_while(|l| l.depth == self.current_scope_depth)
+            .find(|l| l.name == name);
+        match existing {
+            Some(local) => Ok(local.slot),
+            None => self.declare_variable(name),
+        }
     }
 
     fn resolve_local(&self, name: &str) -> Option<(u8, u8)> {
-        // search locals backwards (most recent first)
-        for i in (0..self.local_count).rev() {
-            if let Some(ref local) = self.locals[i] {
-                if local.name == name {
-                    return Some((0, i as u8));
+        if let Some(local) = self.locals.iter().rev().find(|l| l.name == name) {
+            return Some((0, local.slot));
+        }
+        let enclosing = self.enclosing?;
+        let (depth, slot) = enclosing.resolve_local(name)?;
+        Some((depth + 1, slot))
+    }
+
+    /// Push the value of a variable. Undeclared names are an error, except the host's
+    /// `window` / `globalThis`.
+    fn emit_get_var(&mut self, ident: &Ident) -> CompileResult {
+        let name = &*ident.sym;
+        match self.resolve_local(name) {
+            Some((0, slot)) => self.emit_op(Operation::GetLocal(slot)),
+            Some((depth, slot)) => self.emit_op(Operation::GetUpvalue(depth, slot)),
+            None => match (HostGlobal::from_name(name), name) {
+                (Some(host), _) => self.emit_op(Operation::HostGlobal(host as u8)),
+                // read-only global constants compile to plain values
+                (None, "undefined") => self.emit_op(Operation::Undefined),
+                (None, "NaN") => self.emit_op(Operation::LoadFloat64(f64::NAN)),
+                (None, "Infinity") => self.emit_op(Operation::LoadFloat64(f64::INFINITY)),
+                (None, _) => {
+                    return unsupported(format!("undeclared variable `{name}`"), ident.span)
                 }
-            }
+            },
         }
-
-        if let Some(enclosing) = self.enclosing {
-            if let Some((depth, index)) = enclosing.resolve_local(name) {
-                return Some((depth + 1, index));
-            }
-        }
-
-        None
+        Ok(())
     }
 
-    /// Push the value of a variable (local, upvalue or global).
-    fn emit_get_var(&mut self, name: String) {
-        match self.resolve_local(&name) {
-            Some((0, index)) => self.emit_op(Operation::GetLocal(index)),
-            Some((depth, index)) => self.emit_op(Operation::GetUpvalue(depth, index)),
-            None => self.emit_op(Operation::LoadVar(name)),
+    /// Store the top of the stack into a declared variable, leaving it on the stack.
+    fn emit_set_var(&mut self, ident: &Ident) -> CompileResult {
+        let name = &*ident.sym;
+        match self.resolve_local(name) {
+            Some((0, slot)) => self.emit_op(Operation::SetLocal(slot)),
+            Some((depth, slot)) => self.emit_op(Operation::SetUpvalue(depth, slot)),
+            None if HostGlobal::from_name(name).is_some() => {
+                return unsupported(format!("assignment to `{name}`"), ident.span)
+            }
+            None => {
+                return unsupported(
+                    format!("assignment to undeclared variable `{name}`"),
+                    ident.span,
+                )
+            }
         }
-    }
-
-    /// Store the top of the stack into a variable, leaving it on the stack.
-    fn emit_set_var(&mut self, name: String) {
-        match self.resolve_local(&name) {
-            Some((0, index)) => self.emit_op(Operation::SetLocal(index)),
-            Some((depth, index)) => self.emit_op(Operation::SetUpvalue(depth, index)),
-            None => self.emit_op(Operation::StoreVar(name)),
-        }
+        Ok(())
     }
 
     fn compile_var_decl(&mut self, var_decl: &VarDecl) -> CompileResult {
         for decl in var_decl.decls.iter() {
-            self.compile_var_declarator(decl)?;
+            self.compile_var_declarator(var_decl.kind, decl)?;
         }
         Ok(())
     }
@@ -508,9 +612,8 @@ impl<'a> Compiler<'a> {
         }
 
         if let Some(body) = &function.body {
-            for stmt in &body.stmts {
-                fn_compiler.compile_stmt(stmt, false)?;
-            }
+            let stmts: Vec<&Stmt> = body.stmts.iter().collect();
+            fn_compiler.compile_body(&stmts, true, false)?;
         }
 
         // implicit `return undefined`
@@ -520,34 +623,55 @@ impl<'a> Compiler<'a> {
         let code = fn_compiler.bytecode;
         let arity = function.params.len() as u8;
 
-        self.emit_op(Operation::Function(arity, name.clone(), code));
-        let slot = self.declare_variable(name)?;
-        self.emit_op(Operation::SetLocal(slot));
+        self.emit_op(Operation::Function(arity, name, code));
+        self.emit_set_var(&fn_decl.ident)?;
         self.emit_op(Operation::Pop);
         Ok(())
     }
 
-    fn compile_var_declarator(&mut self, var_declarator: &VarDeclarator) -> CompileResult {
+    /// The name was already declared when hoisted by `compile_body`; this only assigns it.
+    fn compile_var_declarator(
+        &mut self,
+        kind: VarDeclKind,
+        var_declarator: &VarDeclarator,
+    ) -> CompileResult {
         let Pat::Ident(name) = &var_declarator.name else {
             return unsupported("destructuring declaration", var_declarator.name.span());
         };
         match var_declarator.init {
             Some(ref init) => self.compile_expr(init)?,
+            // `var x;` leaves an existing value alone
+            None if kind == VarDeclKind::Var => return Ok(()),
             None => self.emit_op(Operation::Undefined),
         }
-        let slot = self.declare_variable(name.id.sym.to_string())?;
-        self.emit_op(Operation::SetLocal(slot));
+        self.emit_set_var(&name.id)?;
         self.emit_op(Operation::Pop);
         Ok(())
     }
 
     fn compile_call(&mut self, expr: &CallExpr) -> CompileResult {
-        // push function onto stack
-        match &expr.callee {
-            Callee::Expr(callee_expr) => self.compile_expr(callee_expr)?,
+        let callee = match &expr.callee {
+            Callee::Expr(callee_expr) => callee_expr,
             Callee::Super(s) => return unsupported("super call", s.span),
             Callee::Import(i) => return unsupported("dynamic import", i.span),
+        };
+
+        // `obj.f()` (and `(obj.f)()`) call f with obj as `this`
+        let mut unwrapped = &**callee;
+        while let Expr::Paren(paren) = unwrapped {
+            unwrapped = &paren.expr;
         }
+        let is_method = if let Expr::Member(member_expr) = unwrapped {
+            // stack: [obj, f]
+            self.compile_expr(&member_expr.obj)?;
+            self.emit_op(Operation::Dup);
+            self.compile_member_prop(&member_expr.prop)?;
+            self.emit_op(Operation::GetProperty);
+            true
+        } else {
+            self.compile_expr(callee)?;
+            false
+        };
 
         // push args onto stack
         for arg in &expr.args {
@@ -558,7 +682,11 @@ impl<'a> Compiler<'a> {
         }
         // push number of args onto stack
         self.emit_op(Operation::UInt64(expr.args.len() as u64));
-        self.emit_op(Operation::Call);
+        self.emit_op(if is_method {
+            Operation::CallMethod
+        } else {
+            Operation::Call
+        });
         Ok(())
     }
 
@@ -584,7 +712,8 @@ impl<'a> Compiler<'a> {
             Expr::Lit(lit) => self.compile_lit(lit)?,
             Expr::Call(call_expr) => self.compile_call(call_expr)?,
             Expr::Member(member_expr) => self.compile_member_expr(member_expr)?,
-            Expr::Ident(ident) => self.emit_get_var(ident.sym.to_string()),
+            Expr::Ident(ident) => self.emit_get_var(ident)?,
+            Expr::This(_) => self.emit_op(Operation::This),
             Expr::Bin(bin_expr) => self.compile_bin_expr(bin_expr)?,
             Expr::Unary(unary_expr) => self.compile_unary_expr(unary_expr)?,
             Expr::Paren(paren_expr) => self.compile_expr(&paren_expr.expr)?,
@@ -610,7 +739,7 @@ impl<'a> Compiler<'a> {
             }
             AssignTarget::Simple(SimpleAssignTarget::Ident(ident)) => {
                 self.compile_expr(&expr.right)?;
-                self.emit_set_var(ident.id.sym.to_string());
+                self.emit_set_var(&ident.id)?;
             }
             AssignTarget::Pat(AssignTargetPat::Array(array_pat)) => {
                 self.compile_expr(&expr.right)?;
@@ -625,9 +754,8 @@ impl<'a> Compiler<'a> {
         let AssignTarget::Simple(SimpleAssignTarget::Ident(ident)) = &expr.left else {
             return unsupported("compound assignment target", expr.left.span());
         };
-        let name = ident.id.sym.to_string();
-
-        self.emit_get_var(name.clone());
+        let ident = &ident.id;
+        self.emit_get_var(ident)?;
 
         // `&&=`, `||=` and `??=` only evaluate and assign the RHS when needed
         let short_circuit = match expr.op {
@@ -640,7 +768,7 @@ impl<'a> Compiler<'a> {
             let end = self.emit_jump(jump_op);
             self.emit_op(Operation::Pop);
             self.compile_expr(&expr.right)?;
-            self.emit_set_var(name);
+            self.emit_set_var(ident)?;
             self.patch_jump(end);
             return Ok(());
         }
@@ -665,7 +793,7 @@ impl<'a> Compiler<'a> {
             | AssignOp::NullishAssign => unreachable!("handled above"),
         };
         self.emit_op(op);
-        self.emit_set_var(name);
+        self.emit_set_var(ident)?;
         Ok(())
     }
 
@@ -725,7 +853,7 @@ impl<'a> Compiler<'a> {
             }
             self.emit_op(Operation::LoadFloat64(i as f64));
             self.emit_op(Operation::GetProperty);
-            self.emit_set_var(ident.id.sym.to_string());
+            self.emit_set_var(&ident.id)?;
             if !is_last {
                 self.emit_op(Operation::Pop);
             }
@@ -795,6 +923,20 @@ impl<'a> Compiler<'a> {
             return Ok(());
         }
 
+        // `typeof window` must not throw when the host has no `window`
+        if expr.op == UnaryOp::TypeOf {
+            if let Expr::Ident(ident) = &*expr.arg {
+                if let (None, Some(host)) = (
+                    self.resolve_local(&ident.sym),
+                    HostGlobal::from_name(&ident.sym),
+                ) {
+                    self.emit_op(Operation::HostGlobal(host as u8 | HOST_GLOBAL_TYPEOF));
+                    self.emit_op(Operation::TypeOf);
+                    return Ok(());
+                }
+            }
+        }
+
         self.compile_expr(&expr.arg)?;
         let op = match expr.op {
             UnaryOp::Minus => Operation::UnaryMinus,
@@ -853,7 +995,6 @@ impl<'a> Compiler<'a> {
                     self.bytecode.push(0x00);
                 }
             }
-            Operation::StoreVar(name) => self.emit_string(&name),
             Operation::Regex(exp, flags) => {
                 self.emit_string(&exp);
                 self.emit_string(&flags);
@@ -895,7 +1036,7 @@ impl<'a> Compiler<'a> {
                 self.bytecode.push(depth);
                 self.bytecode.push(index);
             }
-            Operation::LoadVar(name) => self.emit_string(&name),
+            Operation::HostGlobal(id) => self.bytecode.push(id),
             Operation::GetLocal(index) => {
                 self.bytecode.push(index);
             }
@@ -949,7 +1090,6 @@ fn stmt_kind(stmt: &Stmt) -> &'static str {
 
 fn expr_kind(expr: &Expr) -> &'static str {
     match expr {
-        Expr::This(_) => "this",
         Expr::Fn(_) => "function expression",
         Expr::Arrow(_) => "arrow function",
         Expr::Class(_) => "class expression",
@@ -965,4 +1105,25 @@ fn expr_kind(expr: &Expr) -> &'static str {
         Expr::MetaProp(_) => "meta property",
         _ => "expression",
     }
+}
+
+/// Collects `var` names declared anywhere in a function body, without entering nested functions.
+struct VarCollector<'n> {
+    names: &'n mut Vec<String>,
+}
+
+impl Visit for VarCollector<'_> {
+    fn visit_var_decl(&mut self, n: &VarDecl) {
+        if n.kind == VarDeclKind::Var {
+            for decl in &n.decls {
+                if let Pat::Ident(ident) = &decl.name {
+                    self.names.push(ident.id.sym.to_string());
+                }
+            }
+        }
+        n.visit_children_with(self);
+    }
+    fn visit_function(&mut self, _: &Function) {}
+    fn visit_arrow_expr(&mut self, _: &ArrowExpr) {}
+    fn visit_class(&mut self, _: &Class) {}
 }

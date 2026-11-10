@@ -117,7 +117,7 @@ fn test_global_access() {
     run_test(
         "
         function f() {
-            return Math.PI;
+            return window.Math.PI;
         }
         f()
         ",
@@ -127,16 +127,14 @@ fn test_global_access() {
 
 #[test]
 fn test_global_set_from_function() {
-    // Assuming 'global_var' is not defined, it should be treated as global
-    // But in our compiler, if it's not resolved as local/upvalue, it becomes LoadVar/StoreVar
-    // which accesses this.global or this[varName]
+    // globals are only reachable through `window`
     run_test(
         "
         function f() {
-            global_var = 100;
+            window.global_var = 100;
         }
         f();
-        global_var
+        window.global_var
         ",
         "100",
     );
@@ -167,7 +165,7 @@ fn test_console_log_from_nested() {
         "
         function f() {
             function g() {
-                console.log(123);
+                window.console.log(123);
             }
             g();
         }

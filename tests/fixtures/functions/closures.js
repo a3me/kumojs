@@ -9,10 +9,10 @@ function makeCounter() {
 let counter = makeCounter();
 counter();
 counter();
-console.log(counter());
+window.console.log(counter());
 
 let other = makeCounter();
-console.log(other(), counter());
+window.console.log(other(), counter());
 
 function outer(a) {
     function middle(b) {
@@ -23,4 +23,4 @@ function outer(a) {
     }
     return middle(2);
 }
-console.log(outer(1));
+window.console.log(outer(1));

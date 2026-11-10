@@ -52,7 +52,7 @@ fn test_console_log_function_result() {
         function add(a, b) {
             return a + b;
         }
-        console.log(add(2, 3))
+        window.console.log(add(2, 3))
         "#,
         "5\nundefined",
     );

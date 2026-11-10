@@ -1,6 +1,9 @@
 const fs = require('fs');
 const { VM } = require('./vm');
 
+// simulate a browser: tests are written against `window`
+globalThis.window = globalThis;
+
 function main() {
     const args = process.argv.slice(2);
     if (args.length < 1) {

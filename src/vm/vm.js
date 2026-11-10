@@ -14,6 +14,7 @@ class StackFrame {
         this.parent = parent || null;     // Parent frame for upvalues
         this.ip = 0;                      // Instruction pointer for this frame
         this.locals = new Map();          // Locals for this frame (heap allocated/captured)
+        this.thisValue = undefined;       // `this` inside the frame
         this.id = Math.random();
     }
 }
@@ -41,19 +42,14 @@ class VM {
         this.callStack = [new StackFrame(this.functions[0])];
         this.bytecode = this.functions[0].code;
 
-        // infer global
-        if (typeof window !== 'undefined') {
-            this.global = window;
-        } else if (typeof global !== 'undefined') {
-            this.global = global;
-        } else {
-            this.global = {};
-        }
-
-        // Ensure window is available if we are in node
-        if (typeof window === 'undefined') {
-            this.global.window = this.global;
-        }
+        // The host's real `window` / `globalThis`, exactly as the environment provides them.
+        // Never shim or patch these: input scripts rely on them to detect where they run.
+        this.hostGlobals = [
+            typeof window !== 'undefined' ? window : undefined,
+            typeof globalThis !== 'undefined' ? globalThis : undefined,
+        ];
+        // `this` for plain (non-method) native calls
+        this.global = this.hostGlobals[1] || this.hostGlobals[0];
     }
 
     log(...data) {
@@ -190,32 +186,6 @@ class VM {
                     this.log("OP_RETURN", returnValue);
                     break;
                 }
-                // Operation:: StoreVar(_) => 0x09,
-                case 0x09: {
-                    const varName = this.readString();
-                    let value = this.peek();
-
-                    if (value instanceof VirtualFunction) {
-                        value = this.createHostWrapper(value);
-                    }
-
-                    this[varName] = value;
-                    this.log(`OP_STORE_VAR ${varName} =`, value);
-                    break;
-                }
-                // Operation::LoadVar(_) => 0x0a,
-                case 0x0a: {
-                    const varName = this.readString();
-                    let value;
-                    if (Object.prototype.hasOwnProperty.call(this, varName)) {
-                        value = this[varName];
-                    } else if (varName in this.global) {
-                        value = this.global[varName];
-                    }
-                    this.push(value);
-                    this.log(`OP_LOAD_VAR ${varName} =`, value);
-                    break;
-                }
                 // Operation::UInt8(_) => 0x0b,
                 case 0x0b: {
                     const value = this.readUInt8();
@@ -249,46 +219,10 @@ class VM {
                 }
                 // Operation::Call => 0x0f,
                 case 0x0f: {
-                    const argCount = this.pop();
-                    const args = [];
-                    for (let i = 0; i < argCount; i++) {
-                        args.push(this.pop());
-                    }
-                    args.reverse(); // Stack is LIFO, so args are popped in reverse order
+                    const args = this.popArgs();
                     const func = this.pop();
-
-                    let targetFunc = func;
-                    if (func && func.virtualFunction instanceof VirtualFunction) {
-                        targetFunc = func.virtualFunction;
-                    }
-
-                    if (targetFunc instanceof VirtualFunction) {
-                        const currentFrame = this.callStack[this.callStack.length - 1];
-                        currentFrame.ip = this.ip; // Save current IP
-
-                        const newStackBase = this.stack.length;
-
-                        // Create new stack frame
-                        // Parent is the function's definition environment (closure)
-                        const newFrame = new StackFrame(targetFunc, newStackBase, targetFunc.env);
-
-                        // Initialize locals with arguments
-                        newFrame.locals = new Map();
-                        for (let i = 0; i < args.length; i++) {
-                            newFrame.locals.set(i, args[i]);
-                        }
-                        this.callStack.push(newFrame);
-
-                        this.bytecode = targetFunc.code;
-                        this.ip = -1;
-                        this.log(`OP_CALL virtual function ${targetFunc.name} arity=${targetFunc.arity} args=${args.length}`);
-                    } else if (typeof func === 'function') {
-                        const result = func.apply(this.global, args);
-                        this.push(result);
-                        this.log("OP_CALL native function", result);
-                    } else {
-                        throw new TypeError(`${func} is not a function`);
-                    }
+                    // plain natives keep being called with the host global as `this`
+                    this.callFunction(func, undefined, this.global, args);
                     break;
                 }
                 // Operation::GetProperty => 0x10,
@@ -701,12 +635,81 @@ class VM {
                     this.log(`OP_JUMP_IF_NOT_NULLISH +${offset}`);
                     break;
                 }
+                // Operation::CallMethod => 0x3e,
+                case 0x3e: {
+                    const args = this.popArgs();
+                    const func = this.pop();
+                    const receiver = this.pop();
+                    this.callFunction(func, receiver, receiver, args);
+                    break;
+                }
+                // Operation::This => 0x3f,
+                case 0x3f: {
+                    const frame = this.callStack[this.callStack.length - 1];
+                    this.push(frame.thisValue);
+                    this.log("OP_THIS", frame.thisValue);
+                    break;
+                }
+                // Operation::HostGlobal(_) => 0x40,
+                case 0x40: {
+                    const flags = this.readUInt8();
+                    const which = flags & 0b01; // 0 = window, 1 = globalThis
+                    const value = this.hostGlobals[which];
+                    // HOST_GLOBAL_TYPEOF: `typeof window` gets undefined instead of throwing
+                    if (value === undefined && !(flags & 0b10)) {
+                        throw new ReferenceError(`${which ? 'globalThis' : 'window'} is not defined`);
+                    }
+                    this.push(value);
+                    this.log("OP_HOST_GLOBAL", which);
+                    break;
+                }
                 default: {
                     throw new Error(`Unknown opcode 0x${op.toString(16)} at ${this.ip}`);
                 }
             }
         }
         this.printStack();
+    }
+
+    // Pop the arg count and then that many args, returned in call order.
+    popArgs() {
+        const argCount = this.pop();
+        const args = new Array(argCount);
+        for (let i = argCount - 1; i >= 0; i--) {
+            args[i] = this.pop();
+        }
+        return args;
+    }
+
+    // `vmThis` is `this` inside a VM function; `nativeThis` is `this` for a host function.
+    callFunction(func, vmThis, nativeThis, args) {
+        let targetFunc = func;
+        if (func && func.virtualFunction instanceof VirtualFunction) {
+            targetFunc = func.virtualFunction;
+        }
+
+        if (targetFunc instanceof VirtualFunction) {
+            const currentFrame = this.callStack[this.callStack.length - 1];
+            currentFrame.ip = this.ip; // save current IP
+
+            // parent is the function's definition environment (closure)
+            const newFrame = new StackFrame(targetFunc, this.stack.length, targetFunc.env);
+            newFrame.thisValue = vmThis;
+            for (let i = 0; i < args.length; i++) {
+                newFrame.locals.set(i, args[i]);
+            }
+            this.callStack.push(newFrame);
+
+            this.bytecode = targetFunc.code;
+            this.ip = -1;
+            this.log(`OP_CALL virtual function ${targetFunc.name} arity=${targetFunc.arity} args=${args.length}`);
+        } else if (typeof func === 'function') {
+            const result = func.apply(nativeThis, args);
+            this.push(result);
+            this.log("OP_CALL native function", result);
+        } else {
+            throw new TypeError(`${func} is not a function`);
+        }
     }
 
     createHostWrapper(func) {
@@ -719,7 +722,7 @@ class VM {
             // Create new stack frame
             const newStackBase = vm.stack.length;
             const newFrame = new StackFrame(func, newStackBase, func.env);
-            newFrame.locals = new Map();
+            newFrame.thisValue = this;
             for (let i = 0; i < args.length; i++) {
                 newFrame.locals.set(i, args[i]);
             }

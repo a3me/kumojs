@@ -161,7 +161,7 @@ fn test_console_log() {
     // The expression returns undefined
     // test_runner.js prints the return value (undefined)
     // So we expect "5\nundefined"
-    run_test("let x = 5; console.log(x)", "5\nundefined");
+    run_test("let x = 5; window.console.log(x)", "5\nundefined");
 }
 
 #[test]
@@ -170,7 +170,7 @@ fn test_property_access() {
     // We can't easily test console properties as they are functions
     // But we can test Math.PI if it exists in Node global
     // Node has global.Math
-    run_test("Math.PI", "3.141592653589793");
+    run_test("window.Math.PI", "3.141592653589793");
 }
 
 #[test]
@@ -183,7 +183,7 @@ fn test_global_shadowing() {
 fn test_nested_property_access() {
     // Test accessing a property of a property and calling it
     // Math.max(1, 2)
-    run_test("Math.max(1, 2)", "2");
+    run_test("window.Math.max(1, 2)", "2");
 }
 
 #[test]
@@ -258,4 +258,27 @@ fn test_parse_error_has_location() {
         .compile_source("input.js", "let = ;")
         .unwrap_err();
     assert!(err.to_string().contains("input.js:1:"), "{err}");
+}
+
+#[test]
+fn test_undeclared_variables_are_compile_errors() {
+    let compile = |src| kumojs::Compiler::new().compile_source("input.js", src);
+
+    let err = compile("Math.max(1, 2)").unwrap_err();
+    assert_eq!(err.to_string(), "unsupported undeclared variable `Math` at input.js:1:1");
+
+    let err = compile("function f() {\n  x = 1;\n}").unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "unsupported assignment to undeclared variable `x` at input.js:2:3"
+    );
+
+    let err = compile("window = 1").unwrap_err();
+    assert_eq!(err.to_string(), "unsupported assignment to `window` at input.js:1:1");
+
+    // block-scoped names are gone after the block
+    let err = compile("{ let inner = 1; }\ninner").unwrap_err();
+    assert_eq!(err.to_string(), "unsupported undeclared variable `inner` at input.js:2:1");
+
+    assert!(compile("typeof window; typeof globalThis; window.Math.max(1, 2)").is_ok());
 }
