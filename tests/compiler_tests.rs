@@ -242,14 +242,14 @@ fn test_property_assignment() {
 #[test]
 fn test_unsupported_syntax_is_an_error_with_location() {
     let err = kumojs::Compiler::new()
-        .compile_source("input.js", "let x = 1;\nif (x) { x = 2; }")
+        .compile_source("input.js", "let x = [1];\nfor (let y of x) {}")
         .unwrap_err();
-    assert_eq!(err.to_string(), "unsupported if statement at input.js:2:1");
+    assert_eq!(err.to_string(), "unsupported for-of loop at input.js:2:1");
 
     let err = kumojs::Compiler::new()
-        .compile_source("input.js", "function f() {\n  return x ? 1 : 2;\n}")
+        .compile_source("input.js", "function f() {\n  return () => 1;\n}")
         .unwrap_err();
-    assert_eq!(err.to_string(), "unsupported conditional expression at input.js:2:10");
+    assert_eq!(err.to_string(), "unsupported arrow function at input.js:2:10");
 }
 
 #[test]

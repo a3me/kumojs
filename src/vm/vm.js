@@ -1,9 +1,20 @@
+'use strict';
+
+// marks an array literal hole (`[1, , 3]`) on the stack
+const HOLE = {};
+
+// `arguments` objects are made by a real function, so they look and behave like the host's
+const makeArguments = function () {
+    return arguments;
+};
+
 class VirtualFunction {
     constructor(arity, name, code, env) {
         this.arity = arity;
         this.name = name;
-        this.code = new Uint8Array(code);
-        this.env = env; // Closure environment (parent StackFrame)
+        this.code = code;  // Uint8Array (may be a view into the parent's bytecode)
+        this.env = env;    // Closure environment (parent StackFrame)
+        this.wrapper = null; // host-callable function for this VM function
     }
 }
 
@@ -15,6 +26,8 @@ class StackFrame {
         this.ip = 0;                      // Instruction pointer for this frame
         this.locals = new Map();          // Locals for this frame (heap allocated/captured)
         this.thisValue = undefined;       // `this` inside the frame
+        this.args = [];                   // all call arguments, for `arguments`
+        this.argumentsObject = null;
         this.id = Math.random();
     }
 }
@@ -30,7 +43,8 @@ class VM {
         // setup virtual functions
         this.functions = [];
         for (const funcCode of bytecode) {
-            const func = new VirtualFunction(0, 'main', funcCode, null);
+            const code = funcCode instanceof Uint8Array ? funcCode : new Uint8Array(funcCode);
+            const func = new VirtualFunction(0, 'main', code, null);
             this.functions.push(func);
         }
 
@@ -40,6 +54,8 @@ class VM {
 
         // init call stack with main function
         this.callStack = [new StackFrame(this.functions[0])];
+        // exception handlers: { callDepth, stackLen, catchIp }, innermost last
+        this.handlers = [];
         this.bytecode = this.functions[0].code;
 
         // The host's real `window` / `globalThis`, exactly as the environment provides them.
@@ -71,10 +87,10 @@ class VM {
     }
 
     readUInt32() {
-        return this.bytecode[++this.ip] |
+        return (this.bytecode[++this.ip] |
             (this.bytecode[++this.ip] << 8) |
             (this.bytecode[++this.ip] << 16) |
-            (this.bytecode[++this.ip] << 24);
+            (this.bytecode[++this.ip] << 24)) >>> 0;
     }
 
     readFloat64() {
@@ -85,14 +101,34 @@ class VM {
         return dataview.getFloat64(0, true);
     }
 
+    // u32 byte length, then WTF-8 (UTF-8 that may also encode lone surrogates)
     readString() {
-        this.ip++; // Advance past the opcode or previous null terminator
-        const stringBytes = [];
-        while (this.ip < this.bytecode.length && this.bytecode[this.ip] !== 0x00) {
-            stringBytes.push(this.bytecode[this.ip]);
-            this.ip++;
+        const length = this.readUInt32();
+        const bytes = this.bytecode;
+        let i = this.ip + 1;
+        const end = i + length;
+        let result = '';
+        const units = [];
+        while (i < end) {
+            const b = bytes[i++];
+            if (b < 0x80) {
+                units.push(b);
+            } else if (b < 0xe0) {
+                units.push(((b & 0x1f) << 6) | (bytes[i++] & 0x3f));
+            } else if (b < 0xf0) {
+                units.push(((b & 0x0f) << 12) | ((bytes[i++] & 0x3f) << 6) | (bytes[i++] & 0x3f));
+            } else {
+                const cp = (((b & 0x07) << 18) | ((bytes[i++] & 0x3f) << 12) |
+                    ((bytes[i++] & 0x3f) << 6) | (bytes[i++] & 0x3f)) - 0x10000;
+                units.push(0xd800 + (cp >> 10), 0xdc00 + (cp & 0x3ff));
+            }
+            if (units.length >= 4096) {
+                result += String.fromCharCode.apply(null, units);
+                units.length = 0;
+            }
         }
-        return String.fromCharCode.apply(null, stringBytes);
+        this.ip = end - 1;
+        return result + String.fromCharCode.apply(null, units);
     }
 
     push(value) {
@@ -107,9 +143,30 @@ class VM {
         return this.stack[this.stack.length - 1];
     }
 
+    // Run until the frame on top of the call stack returns. Exceptions are caught by the
+    // innermost handler that belongs to this run; others propagate to the caller.
     run() {
-        const entryStackSize = this.callStack.length;
+        const entryDepth = this.callStack.length;
+        for (;;) {
+            try {
+                return this.execute(entryDepth);
+            } catch (e) {
+                const handler = this.handlers[this.handlers.length - 1];
+                if (!handler || handler.callDepth < entryDepth) {
+                    throw e;
+                }
+                this.handlers.pop();
+                this.callStack.length = handler.callDepth;
+                this.stack.length = handler.stackLen;
+                this.bytecode = this.callStack[handler.callDepth - 1].func.code;
+                this.ip = handler.catchIp;
+                this.push(e);
+                this.log("caught", e);
+            }
+        }
+    }
 
+    execute(entryStackSize) {
         for (; this.ip < this.bytecode.length; this.ip++) {
             // get current opcode
             const op = this.bytecode[this.ip];
@@ -166,6 +223,12 @@ class VM {
                 case 0x08: {
                     const frame = this.callStack.pop();
                     const returnValue = this.pop();
+
+                    // drop handlers left by a `return` from inside `try`
+                    while (this.handlers.length &&
+                        this.handlers[this.handlers.length - 1].callDepth > this.callStack.length) {
+                        this.handlers.pop();
+                    }
 
                     // Clean up stack (remove operands of the returning function)
                     // Locals are in frame.locals, so we don't need to clean them from stack
@@ -239,10 +302,6 @@ class VM {
                     let value = this.pop();
                     const propName = this.pop();
                     const obj = this.pop();
-
-                    if (value instanceof VirtualFunction) {
-                        value = this.createHostWrapper(value);
-                    }
 
                     obj[propName] = value;
                     this.push(value); // SetProperty is an expression that returns the value
@@ -524,11 +583,11 @@ class VM {
                 // Operation::Array(_) => 0x34,
                 case 0x34: {
                     const count = this.readUInt32();
-                    const arr = [];
-                    for (let i = 0; i < count; i++) {
-                        arr.push(this.pop());
+                    const arr = new Array(count);
+                    for (let i = count - 1; i >= 0; i--) {
+                        const value = this.pop();
+                        if (value !== HOLE) arr[i] = value;
                     }
-                    arr.reverse(); // Stack is LIFO, so reverse to get correct order
                     this.push(arr);
                     this.log(`OP_ARRAY count=${count}`, arr);
                     break;
@@ -536,12 +595,13 @@ class VM {
                 // Operation::Object(_) => 0x35,
                 case 0x35: {
                     const count = this.readUInt32();
+                    // pairs are assigned in source order, so later duplicate keys win
+                    const base = this.stack.length - count * 2;
                     const obj = {};
-                    for (let i = 0; i < count; i++) {
-                        const value = this.pop();
-                        const key = this.pop();
-                        obj[key] = value;
+                    for (let i = base; i < this.stack.length; i += 2) {
+                        obj[this.stack[i]] = this.stack[i + 1];
                     }
+                    this.stack.length = base;
                     this.push(obj);
                     this.log(`OP_OBJECT count=${count}`, obj);
                     break;
@@ -553,20 +613,19 @@ class VM {
                     this.log(`OP_DUP`, value);
                     break;
                 }
-                // Operation::Function => 0x37,
-                case 0x37: {
+                // Operation::Function => 0x37 (host-callable), 0x4b (internal: only called
+                // directly from VM code, so no host wrapper is made)
+                case 0x37:
+                case 0x4b: {
                     const arity = this.readUInt8();
                     const name = this.readString();
                     const codeLen = this.readUInt32();
-                    const code = [];
-                    for (let i = 0; i < codeLen; i++) {
-                        code.push(this.readUInt8());
-                    }
+                    const code = this.bytecode.subarray(this.ip + 1, this.ip + 1 + codeLen);
+                    this.ip += codeLen;
 
-                    // Capture current environment
                     const currentFrame = this.callStack[this.callStack.length - 1];
                     const func = new VirtualFunction(arity, name, code, currentFrame);
-                    this.push(func);
+                    this.push(op === 0x37 ? this.createHostWrapper(func) : func);
                     this.log(`OP_FUNCTION name=${name} arity=${arity}`);
                     break;
                 }
@@ -663,6 +722,89 @@ class VM {
                     this.log("OP_HOST_GLOBAL", which);
                     break;
                 }
+                // Operation::Loop(_) => 0x41,
+                case 0x41: {
+                    const offset = this.readUInt32();
+                    this.ip -= offset;
+                    this.log(`OP_LOOP -${offset}`);
+                    break;
+                }
+                // Operation::Dup2 => 0x42,
+                case 0x42: {
+                    const b = this.stack[this.stack.length - 1];
+                    const a = this.stack[this.stack.length - 2];
+                    this.push(a);
+                    this.push(b);
+                    this.log("OP_DUP2");
+                    break;
+                }
+                // Operation::Callee => 0x43,
+                case 0x43: {
+                    const func = this.callStack[this.callStack.length - 1].func;
+                    this.push(func.wrapper || func);
+                    this.log("OP_CALLEE");
+                    break;
+                }
+                // Operation::Arguments => 0x44,
+                case 0x44: {
+                    const frame = this.callStack[this.callStack.length - 1];
+                    if (!frame.argumentsObject) {
+                        frame.argumentsObject = makeArguments.apply(undefined, frame.args);
+                    }
+                    this.push(frame.argumentsObject);
+                    this.log("OP_ARGUMENTS");
+                    break;
+                }
+                // Operation::New => 0x45,
+                case 0x45: {
+                    const args = this.popArgs();
+                    const func = this.pop();
+                    if (typeof func !== 'function') {
+                        throw new TypeError(`${func} is not a constructor`);
+                    }
+                    // VM functions are host functions too, so the host handles prototypes and
+                    // object-vs-primitive return values
+                    this.push(new func(...args));
+                    this.log("OP_NEW");
+                    break;
+                }
+                // Operation::Throw => 0x46,
+                case 0x46: {
+                    throw this.pop();
+                }
+                // Operation::TryStart(_) => 0x47,
+                case 0x47: {
+                    const offset = this.readUInt32();
+                    this.handlers.push({
+                        callDepth: this.callStack.length,
+                        stackLen: this.stack.length,
+                        catchIp: this.ip + offset + 1,
+                    });
+                    this.log("OP_TRY_START");
+                    break;
+                }
+                // Operation::TryEnd => 0x48,
+                case 0x48: {
+                    this.handlers.pop();
+                    this.log("OP_TRY_END");
+                    break;
+                }
+                // Operation::ForInKeys => 0x49,
+                case 0x49: {
+                    const obj = this.pop();
+                    const keys = [];
+                    if (obj !== null && obj !== undefined) {
+                        for (const key in obj) keys.push(key);
+                    }
+                    this.push(keys);
+                    this.log("OP_FOR_IN_KEYS", keys);
+                    break;
+                }
+                // Operation::Hole => 0x4a,
+                case 0x4a: {
+                    this.push(HOLE);
+                    break;
+                }
                 default: {
                     throw new Error(`Unknown opcode 0x${op.toString(16)} at ${this.ip}`);
                 }
@@ -695,7 +837,10 @@ class VM {
             // parent is the function's definition environment (closure)
             const newFrame = new StackFrame(targetFunc, this.stack.length, targetFunc.env);
             newFrame.thisValue = vmThis;
-            for (let i = 0; i < args.length; i++) {
+            newFrame.args = args;
+            // only parameter slots come from arguments; later slots are the function's own
+            const paramCount = Math.min(args.length, targetFunc.arity);
+            for (let i = 0; i < paramCount; i++) {
                 newFrame.locals.set(i, args[i]);
             }
             this.callStack.push(newFrame);
@@ -712,37 +857,46 @@ class VM {
         }
     }
 
+    // A host function that runs a VM function, so natives, `call`/`apply`/`bind`, `new`
+    // and `instanceof` all work on it. Only made for functions that can leave VM code.
     createHostWrapper(func) {
         const vm = this;
         const wrapper = function (...args) {
-            // Save current state
             const savedIp = vm.ip;
             const savedBytecode = vm.bytecode;
+            const savedDepth = vm.callStack.length;
+            const savedStackLen = vm.stack.length;
 
-            // Create new stack frame
-            const newStackBase = vm.stack.length;
-            const newFrame = new StackFrame(func, newStackBase, func.env);
-            newFrame.thisValue = this;
-            for (let i = 0; i < args.length; i++) {
-                newFrame.locals.set(i, args[i]);
+            const frame = new StackFrame(func, savedStackLen, func.env);
+            frame.thisValue = this;
+            frame.args = args;
+            const paramCount = Math.min(args.length, func.arity);
+            for (let i = 0; i < paramCount; i++) {
+                frame.locals.set(i, args[i]);
             }
-            vm.callStack.push(newFrame);
-
-            // Setup VM state
+            vm.callStack.push(frame);
             vm.bytecode = func.code;
             vm.ip = 0;
 
-            // Run VM
-            const result = vm.run();
-
-            // Restore state
-            vm.ip = savedIp;
-            vm.bytecode = savedBytecode;
-
-            return result;
+            try {
+                return vm.run();
+            } finally {
+                // also restores state when the function throws
+                vm.ip = savedIp;
+                vm.bytecode = savedBytecode;
+                vm.callStack.length = savedDepth;
+                vm.stack.length = savedStackLen;
+                while (vm.handlers.length &&
+                    vm.handlers[vm.handlers.length - 1].callDepth > savedDepth) {
+                    vm.handlers.pop();
+                }
+            }
         };
+        Object.defineProperty(wrapper, 'name', { value: func.name });
+        Object.defineProperty(wrapper, 'length', { value: func.arity });
 
         wrapper.virtualFunction = func;
+        func.wrapper = wrapper;
         return wrapper;
     }
 }

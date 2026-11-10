@@ -1,0 +1,10 @@
+let log = window.console.log;
+let s = "héllo wörld ✓ 日本語 🎉";
+log(s, s.length);
+log("\u0000null\u0000".length, "tab\there", "quote\"s", 'single\'s');
+log("🎉".charCodeAt(0), "🎉".charCodeAt(1));
+let lone = "\ud800";
+log(lone.length, lone.charCodeAt(0));
+let obj = { "ключ": 1, "🔑": 2 };
+log(obj["ключ"], obj["🔑"]);
+log(/wör/.test(s), /\d+/g.source);
