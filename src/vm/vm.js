@@ -287,7 +287,7 @@ class VM {
                         this.push(result);
                         this.log("OP_CALL native function", result);
                     } else {
-                        throw new Error(`Attempted to call non-function: ${func}`);
+                        throw new TypeError(`${func} is not a function`);
                     }
                     break;
                 }
@@ -486,28 +486,10 @@ class VM {
                     this.log(`OP_BIT_AND ${a} & ${b} =>`, result);
                     break;
                 }
-                // Operation::LogicalOr => 0x25,
-                case 0x25: {
-                    const b = this.pop();
-                    const a = this.pop();
-                    const result = a || b;
-                    this.push(result);
-                    this.log(`OP_LOGICAL_OR ${a} || ${b} =>`, result);
-                    break;
-                }
-                // Operation::LogicalAnd => 0x26,
-                case 0x26: {
-                    const b = this.pop();
-                    const a = this.pop();
-                    const result = a && b;
-                    this.push(result);
-                    this.log(`OP_LOGICAL_AND ${a} && ${b} =>`, result);
-                    break;
-                }
                 // Operation::In => 0x27,
                 case 0x27: {
-                    const prop = this.pop();
                     const obj = this.pop();
+                    const prop = this.pop();
                     const result = prop in obj;
                     this.push(result);
                     this.log(`OP_IN ${prop} in`, obj, '=>', result);
@@ -529,15 +511,6 @@ class VM {
                     const result = Math.pow(a, b);
                     this.push(result);
                     this.log(`OP_EXP ${a} ** ${b} =>`, result);
-                    break;
-                }
-                // Operation::NullishCoalescing => 0x2a,
-                case 0x2a: {
-                    const b = this.pop();
-                    const a = this.pop();
-                    const result = (a !== null && a !== undefined) ? a : b;
-                    this.push(result);
-                    this.log(`OP_NULLISH_COALESCING ${a} ?? ${b} =>`, result);
                     break;
                 }
                 // Operation::GetLocal(_) => 0x2b,
@@ -699,9 +672,37 @@ class VM {
                     this.log(`OP_SET_UPVALUE depth=${depth} index=${index} value=`, value);
                     break;
                 }
+                // Operation::Jump(_) => 0x3a,
+                case 0x3a: {
+                    const offset = this.readUInt32();
+                    this.ip += offset;
+                    this.log(`OP_JUMP +${offset}`);
+                    break;
+                }
+                // Operation::JumpIfFalse(_) => 0x3b,
+                case 0x3b: {
+                    const offset = this.readUInt32();
+                    if (!this.peek()) this.ip += offset;
+                    this.log(`OP_JUMP_IF_FALSE +${offset}`);
+                    break;
+                }
+                // Operation::JumpIfTrue(_) => 0x3c,
+                case 0x3c: {
+                    const offset = this.readUInt32();
+                    if (this.peek()) this.ip += offset;
+                    this.log(`OP_JUMP_IF_TRUE +${offset}`);
+                    break;
+                }
+                // Operation::JumpIfNotNullish(_) => 0x3d,
+                case 0x3d: {
+                    const offset = this.readUInt32();
+                    const value = this.peek();
+                    if (value !== null && value !== undefined) this.ip += offset;
+                    this.log(`OP_JUMP_IF_NOT_NULLISH +${offset}`);
+                    break;
+                }
                 default: {
-                    this.log("Unknown opcode: " + op);
-                    return;
+                    throw new Error(`Unknown opcode 0x${op.toString(16)} at ${this.ip}`);
                 }
             }
         }

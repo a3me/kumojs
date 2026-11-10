@@ -1,76 +1,6 @@
-use kumojs::Compiler;
-use std::fs::File;
-use std::io::Write;
-use std::process::Command;
-use swc_common::sync::Lrc;
-use swc_common::SourceMap;
-use swc_ecma_parser::{lexer::Lexer, Parser, StringInput, Syntax};
+mod common;
 
-fn compile_source(source: &str) -> Vec<u8> {
-    let cm: Lrc<SourceMap> = Default::default();
-    let fm = cm.new_source_file(swc_common::FileName::Anon.into(), source.to_string());
-
-    let lexer = Lexer::new(
-        Syntax::Es(Default::default()),
-        Default::default(),
-        StringInput::from(&*fm),
-        None,
-    );
-
-    let mut parser = Parser::new_from(lexer);
-
-    if let Some(e) = parser.take_errors().into_iter().next() {
-        panic!("Parser error: {:?}", e);
-    }
-
-    let module = parser.parse_module().expect("failed to parse module");
-
-    let mut compiler = Compiler::new();
-    compiler.compile(&module)
-}
-
-fn run_test(source: &str, expected_result: &str) {
-    let bytecode = compile_source(source);
-
-    // bytecode to temp file
-    let temp_dir = std::env::temp_dir();
-    let bytecode_path = temp_dir.join(format!(
-        "test_{}_{:?}.kumo",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos(),
-        std::thread::current().id()
-    ));
-    let mut file = File::create(&bytecode_path).expect("failed to create temp file");
-    file.write_all(&bytecode).expect("failed to write bytecode");
-
-    // run vm with node
-    let output = Command::new("node")
-        .arg("src/vm/test_runner.js")
-        .arg(&bytecode_path)
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .output()
-        .expect("failed to execute node process");
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        panic!("Node.js process failed:\n{}", stderr);
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let result = stdout.trim();
-
-    if result != expected_result {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        println!("Stderr:\n{}", stderr);
-    }
-
-    assert_eq!(result, expected_result);
-
-    // cleanup
-    let _ = std::fs::remove_file(bytecode_path);
-}
+use common::run_test;
 
 #[test]
 fn test_one_plus_one() {
@@ -307,4 +237,25 @@ fn test_property_assignment() {
     run_test("let obj = {a: 1}; obj.a = 5; obj.a", "5");
     run_test("let obj = {a: 1}; obj.b = 10; obj.b", "10");
     run_test("let arr = [1, 2, 3]; arr[0] = 10; arr[0]", "10");
+}
+
+#[test]
+fn test_unsupported_syntax_is_an_error_with_location() {
+    let err = kumojs::Compiler::new()
+        .compile_source("input.js", "let x = 1;\nif (x) { x = 2; }")
+        .unwrap_err();
+    assert_eq!(err.to_string(), "unsupported if statement at input.js:2:1");
+
+    let err = kumojs::Compiler::new()
+        .compile_source("input.js", "function f() {\n  return x ? 1 : 2;\n}")
+        .unwrap_err();
+    assert_eq!(err.to_string(), "unsupported conditional expression at input.js:2:10");
+}
+
+#[test]
+fn test_parse_error_has_location() {
+    let err = kumojs::Compiler::new()
+        .compile_source("input.js", "let = ;")
+        .unwrap_err();
+    assert!(err.to_string().contains("input.js:1:"), "{err}");
 }

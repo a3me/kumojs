@@ -1,0 +1,18 @@
+let x = 10;
+x += 5;
+x -= 3;
+x *= 2;
+x /= 4;
+x %= 4;
+console.log(x);
+let y = 1;
+y <<= 4;
+y >>= 1;
+y |= 1;
+y &= 7;
+y ^= 2;
+y **= 2;
+console.log(y);
+let s = "a";
+s += "b";
+console.log(s);
