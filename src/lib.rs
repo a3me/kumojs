@@ -750,7 +750,9 @@ impl<'a> Compiler<'a> {
                                     self.emit_op(Operation::LoadString(ident.sym.to_string()));
                                 }
                                 PropName::Str(s) => {
-                                    self.emit_op(Operation::LoadString(s.value.to_string()));
+                                    self.emit_op(Operation::LoadString(
+                                        s.value.to_string_lossy().into_owned(),
+                                    ));
                                 }
                                 PropName::Num(n) => {
                                     self.emit_op(Operation::LoadString(n.value.to_string()));
@@ -859,7 +861,9 @@ impl<'a> Compiler<'a> {
 
     fn compile_lit(&mut self, lit: &Lit) {
         match lit {
-            Lit::Str(s) => self.emit_op(Operation::LoadString(s.value.to_string().clone())),
+            Lit::Str(s) => self.emit_op(Operation::LoadString(
+                s.value.to_string_lossy().into_owned(),
+            )),
             Lit::Num(n) => self.emit_op(Operation::LoadFloat64(n.value)),
             Lit::Bool(b) => self.emit_op(Operation::Bool(b.value)),
             Lit::Null(_) => self.emit_op(Operation::Null),

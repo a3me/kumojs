@@ -8,7 +8,7 @@ use swc_ecma_parser::{lexer::Lexer, Parser, StringInput, Syntax};
 
 fn compile_source(source: &str) -> Vec<u8> {
     let cm: Lrc<SourceMap> = Default::default();
-    let fm = cm.new_source_file(swc_common::FileName::Anon, source.into());
+    let fm = cm.new_source_file(swc_common::FileName::Anon.into(), source.to_string());
 
     let lexer = Lexer::new(
         Syntax::Es(Default::default()),
@@ -19,7 +19,7 @@ fn compile_source(source: &str) -> Vec<u8> {
 
     let mut parser = Parser::new_from(lexer);
 
-    for e in parser.take_errors() {
+    if let Some(e) = parser.take_errors().into_iter().next() {
         panic!("Parser error: {:?}", e);
     }
 
