@@ -1,0 +1,333 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <meta charset="utf-8">
+    <title>kumojs</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link rel="icon" href="/public/cloud.png" type="image/png">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.11.1/highlight.min.js"></script>
+    <link rel="stylesheet"
+        href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.11.1/styles/atom-one-dark.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.11.1/languages/javascript.min.js"></script>
+    <style>
+        body {
+            background-color: #282c34;
+            color: #abb2bf;
+            font-family: Arial, sans-serif;
+            margin: 20px;
+        }
+
+        h1 {
+            text-align: center;
+            margin: 0 0 12px;
+        }
+
+        #toolbar {
+            display: flex;
+            gap: 12px;
+            align-items: center;
+            margin-bottom: 12px;
+        }
+
+        select,
+        button {
+            background: #21252b;
+            color: inherit;
+            border: 1px solid #3a3f4b;
+            padding: 4px 10px;
+        }
+
+        #panes {
+            display: flex;
+            gap: 20px;
+        }
+
+        .pane {
+            flex: 1;
+            min-width: 0;
+        }
+
+        .editor {
+            position: relative;
+            height: 45vh;
+        }
+
+        .editor pre,
+        .editor textarea {
+            position: absolute;
+            inset: 0;
+            height: 100%;
+            white-space: pre;
+            overflow: auto;
+            overflow-wrap: normal;
+        }
+
+        .editor pre {
+            pointer-events: none;
+        }
+
+        .editor pre code.hljs {
+            padding: 0;
+            background: transparent;
+            font: inherit;
+        }
+
+        /* the textarea sits on top: its text is invisible, only the caret and selection show */
+        .editor textarea {
+            background: transparent;
+            color: transparent;
+            caret-color: #abb2bf;
+        }
+
+        textarea,
+        pre {
+            box-sizing: border-box;
+            width: 100%;
+            height: 45vh;
+            margin: 0;
+            padding: 8px;
+            overflow: auto;
+            background: #21252b;
+            color: inherit;
+            border: 1px solid #3a3f4b;
+            font: 13px/1.4 ui-monospace, Menlo, monospace;
+            tab-size: 4;
+            resize: none;
+        }
+
+        #tabs {
+            display: flex;
+            gap: 4px;
+            margin-bottom: 4px;
+        }
+
+        #tabs button.active {
+            background: #3a3f4b;
+        }
+
+        #output {
+            margin-top: 16px;
+            height: 25vh;
+            white-space: pre-wrap;
+        }
+
+        .error {
+            color: #e06c75;
+        }
+
+        .debug {
+            color: #7f848e;
+        }
+    </style>
+</head>
+
+<body>
+    <h1>kumojs</h1>
+
+    <div id="toolbar">
+        <select id="scripts"></select>
+        <button id="run">Run (Ctrl+Enter)</button>
+        <button id="bench">Benchmark</button>
+        <label><input type="checkbox" id="debug"> VM debug log</label>
+    </div>
+
+    <div id="panes">
+        <div class="pane">
+            <div class="editor">
+                <pre aria-hidden="true"><code id="highlight" class="language-javascript"></code></pre>
+                <textarea id="source" spellcheck="false" wrap="off"></textarea>
+            </div>
+        </div>
+        <div class="pane">
+            <div id="tabs">
+                <button data-tab="disasm" class="active">Disassembly</button>
+                <button data-tab="bytecode">Bytecode</button>
+            </div>
+            <pre id="compiled"></pre>
+        </div>
+    </div>
+
+    <pre id="output"></pre>
+
+    <script src="/vm.js"></script>
+    <script>
+        const $ = (id) => document.getElementById(id);
+        const sourceEl = $('source');
+        const outputEl = $('output');
+        const compiledEl = $('compiled');
+        let tab = 'disasm';
+        let compiled = { bytecode: [], disasm: '', error: '' };
+
+        function print(text, cls) {
+            const line = document.createElement('div');
+            if (cls) line.className = cls;
+            line.textContent = text;
+            outputEl.appendChild(line);
+            outputEl.scrollTop = outputEl.scrollHeight;
+        }
+
+        function show(value) {
+            if (typeof value === 'string') return value;
+            try { return value === window ? 'window' : JSON.stringify(value) ?? String(value); } catch { return String(value); }
+        }
+
+        function renderCompiled() {
+            compiledEl.className = compiled.error ? 'error' : '';
+            compiledEl.textContent = compiled.error
+                || (tab === 'disasm' ? compiled.disasm : JSON.stringify(compiled.bytecode));
+        }
+
+        // the highlighted copy sits under the (transparent) textarea and follows its scroll
+        const highlightEl = $('highlight');
+        function highlight() {
+            const code = sourceEl.value;
+            // a trailing newline would otherwise collapse, leaving the last line shorter than the textarea's
+            highlightEl.innerHTML = hljs.highlight(code, { language: 'javascript' }).value + '\n';
+            syncScroll();
+        }
+        function syncScroll() {
+            highlightEl.parentElement.scrollTop = sourceEl.scrollTop;
+            highlightEl.parentElement.scrollLeft = sourceEl.scrollLeft;
+        }
+        sourceEl.addEventListener('input', highlight);
+        sourceEl.addEventListener('scroll', syncScroll);
+
+        async function loadScript(path) {
+            sourceEl.value = await (await fetch(path)).text();
+            highlight();
+        }
+
+        // runs `fn` with console output collected; returns the lines and the error name, if any thrown
+        async function capture(fn) {
+            const lines = [];
+            const levels = ['log', 'info', 'warn', 'error'];
+            const saved = {};
+            for (const level of levels) {
+                saved[level] = console[level];
+                console[level] = (...args) => lines.push({ text: args.map(show).join(' '), error: level === 'error' });
+            }
+            let thrown = null;
+            try {
+                fn();
+            } catch (e) {
+                thrown = e;
+            }
+            // let promise jobs and timers started by the program finish first
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            for (const level of levels) console[level] = saved[level];
+            return { lines, thrown };
+        }
+
+        const errorName = (e) => (e && e.constructor && e.constructor.name) || typeof e;
+        const summary = (r) => r.lines.map((l) => l.text).concat(r.thrown ? ['Uncaught ' + errorName(r.thrown)] : []);
+
+        async function run() {
+            outputEl.textContent = '';
+            const source = sourceEl.value;
+            const response = await fetch('/compile', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ source }),
+            });
+            compiled = await response.json();
+            renderCompiled();
+
+            const directive = source.split('\n', 1)[0];
+            if (directive.startsWith('// compile-error:')) {
+                print(compiled.error ? 'compile error as expected' : 'expected a compile error, but it compiled',
+                    compiled.error ? '' : 'error');
+                return;
+            }
+            if (compiled.error) return;
+            if (directive.startsWith('// skip:')) print(directive.slice(3), 'debug');
+
+            const kumo = await capture(() => new VM([compiled.bytecode], {
+                debug: $('debug').checked,
+                debugLog: (...data) => print(data.map(show).join(' '), 'debug'),
+            }).run());
+            for (const line of kumo.lines) print(line.text, line.error ? 'error' : '');
+            if (kumo.thrown) print('Uncaught ' + (kumo.thrown.stack || kumo.thrown), 'error');
+
+            // the same source run natively, as the differential tests do in node
+            const native = await capture(() => new Function('"use strict";\n' + source)());
+            const same = JSON.stringify(summary(kumo)) === JSON.stringify(summary(native));
+            print(same ? '= matches native' : '≠ differs from native:', same ? 'debug' : 'error');
+            if (!same) for (const text of summary(native)) print('  native: ' + text, 'debug');
+        }
+
+        // times the source in the VM and natively, a few runs each (warm: unlike `node bench/run.js`,
+        // which uses a fresh process per run, so the VM numbers here can look worse)
+        async function bench() {
+            outputEl.textContent = '';
+            const response = await fetch('/compile', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ source: sourceEl.value }),
+            });
+            compiled = await response.json();
+            renderCompiled();
+            if (compiled.error) return;
+
+            const RUNS = 5;
+            const time = async (fn) => {
+                const ms = [];
+                for (let i = 0; i < RUNS; i++) {
+                    let elapsed = 0;
+                    const r = await capture(() => {
+                        const start = performance.now();
+                        try { fn(); } finally { elapsed = performance.now() - start; }
+                    });
+                    if (r.thrown) throw r.thrown;
+                    ms.push(elapsed);
+                }
+                return ms;
+            };
+            const median = (ms) => [...ms].sort((a, b) => a - b)[RUNS >> 1];
+            const source = sourceEl.value;
+            try {
+                const kumo = await time(() => new VM([compiled.bytecode]).run());
+                const native = await time(() => new Function('"use strict";\n' + source)());
+                print(`kumo   ${median(kumo).toFixed(1)} ms   (${kumo.map((m) => m.toFixed(1)).join(', ')})`);
+                print(`native ${median(native).toFixed(1)} ms   (${native.map((m) => m.toFixed(1)).join(', ')})`);
+                print(`ratio  ${(median(kumo) / median(native)).toFixed(0)}x`);
+            } catch (e) {
+                print('Uncaught ' + (e && e.stack || e), 'error');
+            }
+        }
+
+        $('run').onclick = run;
+        $('bench').onclick = bench;
+        $('scripts').onchange = async (e) => { await loadScript(e.target.value); run(); };
+        $('tabs').onclick = (e) => {
+            if (!e.target.dataset.tab) return;
+            tab = e.target.dataset.tab;
+            for (const b of $('tabs').children) b.classList.toggle('active', b === e.target);
+            renderCompiled();
+        };
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); run(); }
+        });
+        sourceEl.addEventListener('keydown', (e) => {
+            if (e.key !== 'Tab') return;
+            e.preventDefault();
+            sourceEl.setRangeText('    ', sourceEl.selectionStart, sourceEl.selectionEnd, 'end');
+            highlight();
+        });
+
+        (async () => {
+            const { examples, fixtures, benchmarks } = await (await fetch('/scripts')).json();
+            const group = (label, dir, names) => {
+                const g = document.createElement('optgroup');
+                g.label = label;
+                g.append(...names.map((n) => new Option(n.replace(/\.js$/, ''), dir + n)));
+                return g;
+            };
+            $('scripts').replaceChildren(group('examples', '/examples/', examples), group('test fixtures', '/fixtures/', fixtures),
+                group('benchmarks', '/bench/', benchmarks));
+            if (examples.length) { await loadScript('/examples/' + examples[0]); run(); }
+        })();
+    </script>
+</body>
+
+</html>

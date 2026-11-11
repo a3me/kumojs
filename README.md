@@ -33,7 +33,7 @@ things to note:
 
 the VM source is `src/vm/vm.ts`; `cargo build` strips its types (needs node 23.2+) into the generated `src/vm/vm.js`. type-check with `npx -p typescript tsc -p .`
 
-run local test harness on http://127.0.0.1:3030/
+playground on http://127.0.0.1:3030/ (edit and run code, pick from `web/examples/`, any `tests/fixtures/` test or a `bench/cases/` benchmark; compares with native)
 ```sh
 cargo run
 ```
