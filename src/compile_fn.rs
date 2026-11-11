@@ -79,6 +79,7 @@ impl<'a> Compiler<'a> {
     }
 
     /// Compile a function body in its own compiler and push the closure.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn compile_closure(
         &mut self,
         name: Option<&str>,

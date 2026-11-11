@@ -25,3 +25,5 @@ CLAUDE.md
 AGENTS.md
 docs/
 tests/**/*.txt
+# generated from src/vm/vm.ts by build.rs
+src/vm/vm.js

@@ -21,27 +21,27 @@ const thisError = () => new ReferenceError(
 // that object). Scripts can't see or reach it: no property or symbol appears on the
 // function, unlike a normal property. Faster to add than a WeakMap entry.
 const ReturnTarget = class {
-    constructor(target) {
+    constructor(target: any) {
         return target;
     }
 };
 const WRAPPED = class extends ReturnTarget {
     #vf;
-    constructor(wrapper, vf) {
+    constructor(wrapper: any, vf: any) {
         super(wrapper);
         this.#vf = vf;
     }
-    static set(wrapper, vf) {
+    static set(wrapper: any, vf: any) {
         new WRAPPED(wrapper, vf);
     }
     // the VM function behind a host wrapper, or undefined for any other value
-    static get(value) {
+    static get(value: any) {
         return typeof value === 'function' && #vf in value ? value.#vf : undefined;
     }
 };
 
 // a VM method (getter, setter, class member) remembers the object it was defined on, for `super`
-const setHomeObject = function (fn, home) {
+const setHomeObject = function (fn: any, home: any) {
     if (typeof fn === 'function') {
         const vf = WRAPPED.get(fn);
         if (vf !== undefined && vf.method) vf.homeObject = home;
@@ -49,7 +49,7 @@ const setHomeObject = function (fn, home) {
 };
 
 // Name a VM function after a property key (computed keys), prefixed by 1 `get ` / 2 `set `.
-const nameFunction = function (fn, key, prefix) {
+const nameFunction = function (fn: any, key: any, prefix: any) {
     const vf = WRAPPED.get(fn);
     if (vf === undefined) return;
     let name = typeof key === 'symbol'
@@ -60,12 +60,12 @@ const nameFunction = function (fn, key, prefix) {
     defineProperty(fn, 'name', { value: name, configurable: true });
 };
 
-const dataProperty = function (value) {
+const dataProperty = function (value: any) {
     return { value, writable: true, enumerable: true, configurable: true };
 };
 
 // whether `new f()` is allowed (the standard check via Reflect.construct's newTarget)
-const isConstructor = function (f) {
+const isConstructor = function (f: any) {
     if (typeof f !== 'function') return false;
     try {
         Reflect.construct(String, [], f);
@@ -78,7 +78,7 @@ const isConstructor = function (f) {
 // captured once, like the other built-ins the VM relies on (only used for `1n` literals)
 const HostBigInt = typeof BigInt === 'function' ? BigInt : undefined;
 
-const toPropertyKey = key => typeof key === 'symbol' ? key : String(key);
+const toPropertyKey = (key: any) => typeof key === 'symbol' ? key : String(key);
 
 // captured once, so input scripts can't change how destructuring behaves
 const arraySlice = Array.prototype.slice;
@@ -89,7 +89,7 @@ const ITER_TAKE_ALL = 0xffffffff;
 
 // The first `count` values of an iterable (array patterns), closing the iterator early
 // like JS does. Arrays with the normal iterator are read directly.
-const iterTake = function (iterable, count) {
+const iterTake = function (iterable: any, count: number) {
     if (Array.isArray(iterable) && iterable[Symbol.iterator] === arrayValues) {
         return iterable;
     }
@@ -108,14 +108,23 @@ const iterTake = function (iterable, count) {
     return values;
 };
 
-const isObject = v => v !== null && (typeof v === 'object' || typeof v === 'function');
+const isObject = (v: any) => v !== null && (typeof v === 'object' || typeof v === 'function');
 
 // `for-of` iteration state. Arrays using the built-in iterator are walked by index (the
 // same values and order the iterator would give, without creating it).
 const ArrayIteratorPrototype = Object.getPrototypeOf([][Symbol.iterator]());
 const arrayIteratorNext = ArrayIteratorPrototype.next;
 class IterRecord {
-    constructor(iterator, next, array) {
+    declare iterator: any;
+    declare next: any;
+    declare array: any;
+    declare index: number;
+    declare done: boolean;
+    declare sync: boolean;
+    declare pending: any;
+    declare pendingResult: any;
+
+    constructor(iterator: any, next: any, array: any) {
         this.iterator = iterator;
         this.next = next;
         this.array = array;
@@ -133,7 +142,7 @@ const NO_VALUE = {};
 // returned by `iterStep` when the iterator is done
 const ITER_DONE = {};
 
-const getIterator = function (iterable) {
+const getIterator = function (iterable: any) {
     if (Array.isArray(iterable) && iterable[Symbol.iterator] === arrayValues &&
         ArrayIteratorPrototype.next === arrayIteratorNext) {
         return new IterRecord(null, null, iterable);
@@ -148,7 +157,7 @@ const getIterator = function (iterable) {
 };
 
 // The next value, or ITER_DONE. An iterator that throws or finishes is done (not closed).
-const iterStep = function (record) {
+const iterStep = function (record: IterRecord) {
     if (record.array !== null) {
         if (record.index < record.array.length) return record.array[record.index++];
         record.done = true;
@@ -171,7 +180,7 @@ const iterStep = function (record) {
 
 // Close an iterator left early: call its `return()`. Leaving by a throw (`quiet`) ignores
 // errors from it, so the original error wins.
-const iterClose = function (record, quiet) {
+const iterClose = function (record: IterRecord, quiet?: boolean) {
     if (record.done || record.array !== null) return;
     record.done = true;
     const iterator = record.iterator;
@@ -199,7 +208,7 @@ const AsyncIteratorPrototype = Object.getPrototypeOf(AsyncGeneratorFunctionProto
 const HostPromise = Promise;
 const promiseResolve = Promise.resolve;
 const promiseThen = Promise.prototype.then;
-const resolved = value => promiseResolve.call(HostPromise, value);
+const resolved = (value: any) => promiseResolve.call(HostPromise, value);
 
 // how a suspended coroutine is resumed: next(v) / throw(e) / return(v)
 const RESUME_NEXT = 0;
@@ -217,7 +226,23 @@ const CO_AWAITING_RETURN = 5; // async generator: awaiting a `return(v)` value a
 // A generator / async function's suspendable state. While it's suspended its frame is off
 // the call stack, with its operands and exception handlers saved here.
 class Coroutine {
-    constructor(vm, frame, func) {
+    declare vm: VM;
+    declare frame: StackFrame;
+    declare generator: boolean;
+    declare async: boolean;
+    declare state: number;
+    declare stack: any[] | null;
+    declare handlers: any[] | null;
+    declare normalIp: number;
+    declare throwIp: number;
+    declare returnIp: number;
+    declare promise: any;
+    declare resolve: any;
+    declare reject: any;
+    declare queue: any;
+    declare forOf: any;
+
+    constructor(vm: VM, frame: StackFrame, func: any) {
         this.vm = vm;
         this.frame = frame;
         this.generator = func.generator;
@@ -244,14 +269,14 @@ class Coroutine {
 const hiddenSlot = function () {
     return class extends ReturnTarget {
         #value;
-        constructor(target, value) {
+        constructor(target: any, value: any) {
             super(target);
             this.#value = value;
         }
-        static set(target, value) {
+        static set(target: any, value: any) {
             new this(target, value);
         }
-        static get(target) {
+        static get(target: any) {
             return isObject(target) && #value in target ? target.#value : undefined;
         }
     };
@@ -260,17 +285,17 @@ const hiddenSlot = function () {
 const COROUTINES = hiddenSlot();
 
 // the generator objects' `next` / `throw` / `return` (VM code calling them resumes inline)
-const syncCoroutine = function (gen, method) {
+const syncCoroutine = function (gen: any, method: any) {
     const co = COROUTINES.get(gen);
     if (co === undefined || co.async) {
         throw new TypeError(`${method} method called on incompatible receiver ${String(gen)}`);
     }
     return co;
 };
-const genNext = ({ next(v) { return syncCoroutine(this, 'next').vm.generatorResume(COROUTINES.get(this), RESUME_NEXT, v, false); } }).next;
-const genReturn = ({ return(v) { return syncCoroutine(this, 'return').vm.generatorResume(COROUTINES.get(this), RESUME_RETURN, v, false); } }).return;
-const genThrow = ({ throw(e) { return syncCoroutine(this, 'throw').vm.generatorResume(COROUTINES.get(this), RESUME_THROW, e, false); } }).throw;
-const methodProperty = value => ({ value, writable: true, enumerable: false, configurable: true });
+const genNext = ({ next(v: any) { return syncCoroutine(this, 'next').vm.generatorResume(COROUTINES.get(this), RESUME_NEXT, v, false); } }).next;
+const genReturn = ({ return(v: any) { return syncCoroutine(this, 'return').vm.generatorResume(COROUTINES.get(this), RESUME_RETURN, v, false); } }).return;
+const genThrow = ({ throw(e: any) { return syncCoroutine(this, 'throw').vm.generatorResume(COROUTINES.get(this), RESUME_THROW, e, false); } }).throw;
+const methodProperty = (value: any) => ({ value, writable: true, enumerable: false, configurable: true });
 const KumoGeneratorPrototype = Object.create(IteratorPrototype, {
     next: methodProperty(genNext),
     return: methodProperty(genReturn),
@@ -279,7 +304,7 @@ const KumoGeneratorPrototype = Object.create(IteratorPrototype, {
 });
 
 // async generator requests are queued and run one at a time
-const asyncGenRequest = function (gen, mode, value, method) {
+const asyncGenRequest = function (gen: any, mode: number, value: any, method: any) {
     return new HostPromise((resolve, reject) => {
         const co = COROUTINES.get(gen);
         if (co === undefined || !co.async || !co.generator) {
@@ -291,9 +316,9 @@ const asyncGenRequest = function (gen, mode, value, method) {
     });
 };
 const KumoAsyncGeneratorPrototype = Object.create(AsyncIteratorPrototype, {
-    next: methodProperty(({ next(v) { return asyncGenRequest(this, RESUME_NEXT, v, 'next'); } }).next),
-    return: methodProperty(({ return(v) { return asyncGenRequest(this, RESUME_RETURN, v, 'return'); } }).return),
-    throw: methodProperty(({ throw(e) { return asyncGenRequest(this, RESUME_THROW, e, 'throw'); } }).throw),
+    next: methodProperty(({ next(v: any) { return asyncGenRequest(this, RESUME_NEXT, v, 'next'); } }).next),
+    return: methodProperty(({ return(v: any) { return asyncGenRequest(this, RESUME_RETURN, v, 'return'); } }).return),
+    throw: methodProperty(({ throw(e: any) { return asyncGenRequest(this, RESUME_THROW, e, 'throw'); } }).throw),
     [Symbol.toStringTag]: { value: 'AsyncGenerator', configurable: true },
 });
 
@@ -301,18 +326,18 @@ const KumoAsyncGeneratorPrototype = Object.create(AsyncIteratorPrototype, {
 const RESUMED_INLINE = {};
 // returned by `delegateCall` / `asyncIterClose` when there's nothing to call
 const NOTHING = {};
-const EMPTY = [];
+const EMPTY: any[] = [];
 
-const iterResult = (value, done) => ({ value, done });
+const iterResult = (value: any, done: boolean) => ({ value, done });
 
 // async-from-sync iteration: a sync result whose value is awaited
-const asyncFromSync = function (result) {
+const asyncFromSync = function (result: any) {
     const done = !!result.done;
     return promiseThen.call(resolved(result.value), v => iterResult(v, done));
 };
 
 // a sync iterator record's next result (for async use, and `yield*`)
-const syncNextResult = function (record, value) {
+const syncNextResult = function (record: IterRecord, value: any) {
     if (record.array !== null) {
         const v = iterStep(record);
         return v === ITER_DONE ? iterResult(undefined, true) : iterResult(v, false);
@@ -323,7 +348,7 @@ const syncNextResult = function (record, value) {
 };
 
 // `for await`: the promise (or value) of the next result
-const asyncIterNext = function (record) {
+const asyncIterNext = function (record: IterRecord) {
     try {
         if (record.sync) return asyncFromSync(syncNextResult(record, undefined));
         return record.next.call(record.iterator);
@@ -335,7 +360,7 @@ const asyncIterNext = function (record) {
 
 // `for await` closing: what to await from `return()`, or NOTHING. Leaving by a throw
 // (`quiet`) ignores errors, including a rejection.
-const asyncIterClose = function (record, quiet) {
+const asyncIterClose = function (record: IterRecord, quiet?: boolean) {
     if (record.done) return NOTHING;
     record.done = true;
     let result;
@@ -371,7 +396,7 @@ const LITTLE_ENDIAN = new Uint8Array(new Uint16Array([1]).buffer)[0] === 1;
 const HOLE = {};
 
 // `arguments` objects are made by a real function, so they look and behave like the host's
-const makeArguments = function () {
+const makeArguments = function (..._args: any[]) {
     return arguments;
 };
 
@@ -382,28 +407,28 @@ const makeArguments = function () {
 // (setting `name` afterwards with defineProperty is slow).
 const WRAPPERS = [
     [
-        (vm, f, n) => ({ [n]: function () { return vm.runFromHost(f, this, arguments, new.target); } })[n],
-        (vm, f, n) => ({ [n]: function (a) { return vm.runFromHost(f, this, arguments, new.target); } })[n],
-        (vm, f, n) => ({ [n]: function (a, b) { return vm.runFromHost(f, this, arguments, new.target); } })[n],
-        (vm, f, n) => ({ [n]: function (a, b, c) { return vm.runFromHost(f, this, arguments, new.target); } })[n],
+        (vm: VM, f: any, n: string) => ({ [n]: function () { return vm.runFromHost(f, this, arguments, new.target); } })[n],
+        (vm: VM, f: any, n: string) => ({ [n]: function (a: any) { return vm.runFromHost(f, this, arguments, new.target); } })[n],
+        (vm: VM, f: any, n: string) => ({ [n]: function (a: any, b: any) { return vm.runFromHost(f, this, arguments, new.target); } })[n],
+        (vm: VM, f: any, n: string) => ({ [n]: function (a: any, b: any, c: any) { return vm.runFromHost(f, this, arguments, new.target); } })[n],
     ],
     [
-        (vm, f, n) => ({ [n]: (...r) => vm.runFromHost(f, undefined, r) })[n],
-        (vm, f, n) => ({ [n]: (a, ...r) => vm.runFromHost(f, undefined, [a, ...r]) })[n],
-        (vm, f, n) => ({ [n]: (a, b, ...r) => vm.runFromHost(f, undefined, [a, b, ...r]) })[n],
-        (vm, f, n) => ({ [n]: (a, b, c, ...r) => vm.runFromHost(f, undefined, [a, b, c, ...r]) })[n],
+        (vm: VM, f: any, n: string) => ({ [n]: (...r: any[]) => vm.runFromHost(f, undefined, r) })[n],
+        (vm: VM, f: any, n: string) => ({ [n]: (a: any, ...r: any[]) => vm.runFromHost(f, undefined, [a, ...r]) })[n],
+        (vm: VM, f: any, n: string) => ({ [n]: (a: any, b: any, ...r: any[]) => vm.runFromHost(f, undefined, [a, b, ...r]) })[n],
+        (vm: VM, f: any, n: string) => ({ [n]: (a: any, b: any, c: any, ...r: any[]) => vm.runFromHost(f, undefined, [a, b, c, ...r]) })[n],
     ],
     [
-        (vm, f, n) => ({ [n]() { return vm.runFromHost(f, this, arguments); } })[n],
-        (vm, f, n) => ({ [n](a) { return vm.runFromHost(f, this, arguments); } })[n],
-        (vm, f, n) => ({ [n](a, b) { return vm.runFromHost(f, this, arguments); } })[n],
-        (vm, f, n) => ({ [n](a, b, c) { return vm.runFromHost(f, this, arguments); } })[n],
+        (vm: VM, f: any, n: string) => ({ [n]() { return vm.runFromHost(f, this, arguments); } })[n],
+        (vm: VM, f: any, n: string) => ({ [n](a: any) { return vm.runFromHost(f, this, arguments); } })[n],
+        (vm: VM, f: any, n: string) => ({ [n](a: any, b: any) { return vm.runFromHost(f, this, arguments); } })[n],
+        (vm: VM, f: any, n: string) => ({ [n](a: any, b: any, c: any) { return vm.runFromHost(f, this, arguments); } })[n],
     ],
 ];
 
 // Class constructors need `new`; a base class uses the `this` the host's `new` made,
 // a derived class gets its `this` from `super(...)`.
-const makeClassWrapper = (vm, f, n) => ({
+const makeClassWrapper = (vm: VM, f: any, n: string) => ({
     [n]: function () {
         if (new.target === undefined) {
             throw new TypeError(`Class constructor ${f.name} cannot be invoked without 'new'`);
@@ -422,7 +447,13 @@ const PRIVATE_ACCESSOR = 2;
 // frozen objects and doesn't touch proxies). Methods and accessors are shared: an object
 // may use them once it's in the brand (the class's WeakSet).
 class PrivateName {
-    constructor(kind) {
+    declare kind: number;
+    declare values: WeakMap<object, any> | null;
+    declare brand: any;
+    declare method: any;
+    declare setter: any;
+
+    constructor(kind: number) {
         this.kind = kind;
         this.values = kind === PRIVATE_FIELD ? new WeakMap() : null;
         this.brand = null;
@@ -434,7 +465,26 @@ class PrivateName {
 const privateError = () => new TypeError('Cannot access private member from an object whose class did not declare it');
 
 class VirtualFunction {
-    constructor(arity, params, flags, name, code, captures) {
+    declare generator: boolean;
+    declare async: boolean;
+    declare genPrototype: any;
+    declare arity: number;
+    declare params: number;
+    declare arrow: boolean;
+    declare method: boolean;
+    declare isClass: boolean;
+    declare derived: boolean;
+    declare fieldKeys: any;
+    declare initFn: any;
+    declare brand: any;
+    declare homeObject: any;
+    declare argsFrame: any;
+    declare name: string;
+    declare code: Uint8Array;
+    declare captures: any[];
+    declare wrapper: any;
+
+    constructor(arity: number, params: number, flags: number, name: string, code: Uint8Array, captures: any[]) {
         const kind = flags & 7;
         this.generator = (flags & 8) !== 0; // `function*`: calling it makes a generator
         this.async = (flags & 16) !== 0;    // `async`: calling it returns a promise
@@ -467,7 +517,19 @@ const genericArray = function () {
 };
 
 class StackFrame {
-    constructor(func, stackBase) {
+    declare func: VirtualFunction;
+    declare stackBase: number;
+    declare ip: number;
+    declare locals: any[];
+    declare thisValue: any;
+    declare args: any[];
+    declare argumentsObject: any;
+    declare argsFrame: StackFrame;
+    declare newTarget: any;
+    declare isConstruct: boolean;
+    declare coroutine: Coroutine | null;
+
+    constructor(func: any, stackBase?: number) {
         this.func = func;
         this.stackBase = stackBase || 0;  // Index where this frame's operands start (for restoration)
         this.ip = 0;                      // Instruction pointer for this frame
@@ -485,7 +547,22 @@ class StackFrame {
 }
 
 class VM {
-    constructor(bytecode, options) {
+    declare options: { debug: boolean; debugLog: any };
+    declare debug: boolean;
+    declare functions: VirtualFunction[];
+    declare ip: number;
+    declare stack: any[];
+    declare callStack: StackFrame[];
+    declare handlers: any[];
+    declare templates: Map<any, any>;
+    declare bytecode: Uint8Array;
+    declare stringCaches: Map<any, any>;
+    declare stringBuffer: any;
+    declare stringCache: any;
+    declare hostGlobals: any[];
+    declare global: any;
+
+    constructor(bytecode: any[], options?: any) {
 
         this.options = options || {
             debug: false,
@@ -527,7 +604,7 @@ class VM {
         this.global = this.hostGlobals[1] || this.hostGlobals[0];
     }
 
-    log(...data) {
+    log(...data: any[]) {
         if (this.options.debug && this.options.debugLog) {
             this.options.debugLog(...data);
         }
@@ -591,7 +668,7 @@ class VM {
         return string;
     }
 
-    decodeString(length) {
+    decodeString(length: number) {
         const bytes = this.bytecode;
         let i = this.ip + 1;
         const end = i + length;
@@ -619,7 +696,7 @@ class VM {
         return result + String.fromCharCode.apply(null, units);
     }
 
-    push(value) {
+    push(value: any) {
         this.stack.push(value);
     }
 
@@ -665,7 +742,7 @@ class VM {
     // finished, and an async function stops the throw, rejecting its promise instead and
     // returning that to its caller. Returns NOTHING if the throw goes on; otherwise the
     // promise when it's for `run()` to return, or undefined to keep running.
-    unwindCoroutines(e, keep, entryDepth) {
+    unwindCoroutines(e: any, keep: any, entryDepth: number) {
         let boundary = -1;
         for (let i = this.callStack.length - 1; i >= keep; i--) {
             const co = this.callStack[i].coroutine;
@@ -678,7 +755,7 @@ class VM {
         }
         if (boundary < 0) return NOTHING;
         const frame = this.callStack[boundary];
-        const co = frame.coroutine;
+        const co = frame.coroutine!;
         co.reject(e);
         this.callStack.length = boundary;
         while (this.handlers.length &&
@@ -694,7 +771,7 @@ class VM {
         return undefined;
     }
 
-    execute(entryStackSize) {
+    execute(entryStackSize: number) {
         // read once: log arguments (often template strings) are only built when debugging
         const debug = this.debug;
         for (; this.ip < this.bytecode.length; this.ip++) {
@@ -751,7 +828,7 @@ class VM {
                 }
                 // Operation::Return => 0x08,
                 case 0x08: {
-                    const frame = this.callStack.pop();
+                    const frame = this.callStack.pop()!;
                     let returnValue = this.pop();
                     if (frame.isConstruct && (returnValue === null ||
                         (typeof returnValue !== 'object' && typeof returnValue !== 'function'))) {
@@ -1137,7 +1214,7 @@ class VM {
                     const count = this.readUInt32();
                     // pairs are assigned in source order, so later duplicate keys win
                     const base = this.stack.length - count * 2;
-                    const obj = {};
+                    const obj: any = {};
                     for (let i = base; i < this.stack.length; i += 2) {
                         const value = this.stack[i + 1];
                         obj[this.stack[i]] = value;
@@ -1450,11 +1527,11 @@ class VM {
                 case 0x58: {
                     const keys = this.pop();
                     const source = Object(this.pop());
-                    const used = new Set(keys.map(k => typeof k === 'symbol' ? k : String(k)));
-                    const rest = {};
+                    const used = new Set(keys.map((k: any) => typeof k === 'symbol' ? k : String(k)));
+                    const rest: any = {};
                     for (const key of Reflect.ownKeys(source)) {
                         if (!used.has(key) && propertyIsEnumerable.call(source, key)) {
-                            rest[key] = source[key];
+                            rest[key] = (source as any)[key];
                         }
                     }
                     this.push(rest);
@@ -1606,7 +1683,7 @@ class VM {
                         value = this.runFromHost(init, cls, []);
                     }
                     if (key instanceof PrivateName) {
-                        key.values.set(cls, value);
+                        key.values!.set(cls, value);
                     } else {
                         defineProperty(cls, toPropertyKey(key), dataProperty(value));
                     }
@@ -1707,7 +1784,7 @@ class VM {
                 }
                 // Operation::LoadBigInt(_) => 0x6d,
                 case 0x6d: {
-                    this.push(HostBigInt(this.readString()));
+                    this.push(HostBigInt!(this.readString()));
                     debug && this.log("OP_LOAD_BIGINT", this.peek());
                     break;
                 }
@@ -1859,8 +1936,8 @@ class VM {
                     const key = frame.func.fieldKeys[index];
                     const obj = frame.thisValue;
                     if (key instanceof PrivateName) {
-                        if (key.values.has(obj)) throw new TypeError('Cannot initialize a private field twice on the same object');
-                        key.values.set(obj, value);
+                        if (key.values!.has(obj)) throw new TypeError('Cannot initialize a private field twice on the same object');
+                        key.values!.set(obj, value);
                     } else {
                         if (nameIt) nameFunction(value, key, 0);
                         defineProperty(obj, key, dataProperty(value));
@@ -1995,7 +2072,7 @@ class VM {
         const returned = this.readUInt32();
         const end = this.ip + 1;
         const value = this.pop();
-        const co = this.callStack[this.callStack.length - 1].coroutine;
+        const co = this.callStack[this.callStack.length - 1].coroutine!;
         co.normalIp = end + normal;
         co.throwIp = end + thrown;
         co.returnIp = end + returned;
@@ -2020,7 +2097,7 @@ class VM {
     opAwait() {
         // (resolving first: a throwing `then` / `constructor` throws right here)
         const promise = resolved(this.pop());
-        const co = this.callStack[this.callStack.length - 1].coroutine;
+        const co = this.callStack[this.callStack.length - 1].coroutine!;
         co.throwIp = this.ip + 1;
         co.normalIp = this.ip + 2;
         co.state = CO_AWAITING;
@@ -2219,7 +2296,7 @@ class VM {
     }
 
     // `vmThis` is `this` inside a VM function; `nativeThis` is `this` for a host function.
-    callFunction(func, vmThis, nativeThis, args) {
+    callFunction(func: any, vmThis: any, nativeThis: any, args: any) {
         let targetFunc = func;
         if (typeof func === 'function') {
             const vf = WRAPPED.get(func);
@@ -2260,7 +2337,7 @@ class VM {
     }
 
     // A new frame for calling `func`.
-    makeFrame(func, thisValue, args) {
+    makeFrame(func: any, thisValue: any, args: any) {
         const frame = new StackFrame(func, this.stack.length);
         frame.args = args;
         if (func.arrow) {
@@ -2286,7 +2363,7 @@ class VM {
 
     // Take a suspending coroutine's frame (on top) off the call stack, saving its
     // operands and exception handlers.
-    suspendFrame(co) {
+    suspendFrame(co: Coroutine) {
         const frame = co.frame;
         const depth = this.callStack.length;
         co.stack = this.stack.length > frame.stackBase ? this.stack.slice(frame.stackBase) : EMPTY;
@@ -2301,10 +2378,10 @@ class VM {
     }
 
     // Put a suspended coroutine's frame back on top of the call stack, continuing at `ip`.
-    restoreFrame(co, ip) {
+    restoreFrame(co: Coroutine, ip: number) {
         const frame = co.frame;
         frame.stackBase = this.stack.length;
-        const saved = co.stack;
+        const saved = co.stack!;
         for (let i = 0; i < saved.length; i++) this.stack.push(saved[i]);
         co.stack = null;
         const depth = this.callStack.length + 1;
@@ -2323,7 +2400,7 @@ class VM {
 
     // Resume a suspended coroutine in a nested `run()` with a sent value, returning what
     // it gives back when it next suspends or finishes.
-    resumeNested(co, mode, value) {
+    resumeNested(co: Coroutine, mode: number, value: any) {
         const ip = mode === RESUME_NEXT ? co.normalIp : mode === RESUME_THROW ? co.throwIp : co.returnIp;
         const savedIp = this.ip;
         const savedBytecode = this.bytecode;
@@ -2347,7 +2424,7 @@ class VM {
 
     // A sync generator's next / throw / return. `inline` (VM code calling it) resumes the
     // generator in the running loop, its result arriving when it next suspends.
-    generatorResume(co, mode, value, inline) {
+    generatorResume(co: Coroutine, mode: number, value: any, inline?: boolean) {
         if (co.state === CO_RUNNING) throw new TypeError('Generator is already running');
         if (co.state === CO_START && mode !== RESUME_NEXT) co.state = CO_DONE;
         if (co.state === CO_DONE) {
@@ -2364,7 +2441,7 @@ class VM {
 
     // `for-of` over a VM generator of this VM: resume it in this loop, re-running the
     // `IterNext` at `start` once it yields. False if it can't be resumed here.
-    resumeForOf(record, start) {
+    resumeForOf(record: IterRecord, start: any) {
         const co = COROUTINES.get(record.iterator);
         if (co === undefined || co.vm !== this || co.async ||
             (co.state !== CO_SUSPENDED && co.state !== CO_START)) {
@@ -2378,7 +2455,7 @@ class VM {
     }
 
     // a `yield*` result object passed through to `for-of`: its value, or ITER_DONE
-    unwrapResult(record, result) {
+    unwrapResult(record: IterRecord, result: any) {
         try {
             if (!isObject(result)) throw new TypeError(`Iterator result ${String(result)} is not an object`);
             if (result.done) {
@@ -2393,7 +2470,7 @@ class VM {
     }
 
     // A coroutine's frame returned `value`: what its caller (or resumer) gets.
-    finishCoroutine(co, value) {
+    finishCoroutine(co: Coroutine, value: any) {
         co.state = CO_DONE;
         if (!co.async) {
             if (co.forOf === null) return iterResult(value, true);
@@ -2412,14 +2489,14 @@ class VM {
 
     // Resume `co` once an awaited promise settles. (Kept out of `execute`: a closure there
     // capturing `this` makes V8 slow down the whole loop.)
-    awaitPromise(co, promise) {
+    awaitPromise(co: Coroutine, promise: any) {
         promiseThen.call(promise,
             v => this.resumeAwait(co, RESUME_NEXT, v),
             e => this.resumeAwait(co, RESUME_THROW, e));
     }
 
     // An awaited value settled.
-    resumeAwait(co, mode, value) {
+    resumeAwait(co: Coroutine, mode: number, value: any) {
         if (!co.generator) {
             this.resumeNested(co, mode, value);
             return;
@@ -2430,7 +2507,7 @@ class VM {
 
     // Run an async generator until it yields, awaits or finishes; a throw out of it
     // rejects the request it was working on.
-    runAsyncGen(co, mode, value) {
+    runAsyncGen(co: Coroutine, mode: number, value: any) {
         try {
             this.resumeNested(co, mode, value);
         } catch (e) {
@@ -2440,7 +2517,7 @@ class VM {
     }
 
     // Work through an async generator's queued requests while it isn't busy.
-    drainAsyncGen(co) {
+    drainAsyncGen(co: Coroutine) {
         const queue = co.queue;
         while (queue.length > 0) {
             const state = co.state;
@@ -2457,7 +2534,7 @@ class VM {
                 } else {
                     // `return(v)` on a finished generator awaits v
                     co.state = CO_AWAITING_RETURN;
-                    const settle = (ok, v) => {
+                    const settle = (ok: boolean, v: any) => {
                         co.state = CO_DONE;
                         queue.shift();
                         if (ok) request.resolve(iterResult(v, true));
@@ -2479,7 +2556,7 @@ class VM {
 
     // One step of `yield*`: call the inner iterator's next / throw / return. NOTHING when
     // a return finds no `return` method (the generator then returns the value itself).
-    delegateCall(record, mode, received) {
+    delegateCall(record: IterRecord, mode: number, received: any) {
         if (record.array !== null) {
             if (mode === RESUME_NEXT) {
                 const result = syncNextResult(record, received);
@@ -2510,7 +2587,7 @@ class VM {
 
     // Set up a new instance of a class: its private methods first, then its fields, whose
     // method runs in this loop and gives back the instance. Pushes the instance.
-    initInstance(func, obj) {
+    initInstance(func: any, obj: any) {
         const brand = func.brand;
         if (brand !== null) {
             if (brand.has(obj)) throw new TypeError('Cannot initialize private methods twice on the same object');
@@ -2529,7 +2606,7 @@ class VM {
 
     // Run a VM function for a host caller, in a nested `run()`. `construct` runs it as
     // `new` (for class constructors, which set up fields first).
-    runFromHost(func, thisValue, args, newTarget, construct) {
+    runFromHost(func: any, thisValue: any, args: any, newTarget?: any, construct?: boolean) {
         const savedIp = this.ip;
         const savedBytecode = this.bytecode;
         const savedDepth = this.callStack.length;
@@ -2560,7 +2637,7 @@ class VM {
     // A host function that runs a VM function, so natives, `call`/`apply`/`bind`, `new`
     // and `instanceof` all work on it. Only made for functions that can leave VM code.
     // Arrows and methods get host arrows / methods: not constructible, no `prototype`.
-    createHostWrapper(func) {
+    createHostWrapper(func: any) {
         let kind = func.arrow ? FN_ARROW : func.method ? FN_METHOD : FN_NORMAL;
         const coroutine = func.generator || func.async;
         // generator / async functions can't be used with `new` (method wrappers can't)
@@ -2594,6 +2671,7 @@ class VM {
     }
 }
 
+declare const module: any;
 if (typeof module !== 'undefined' && module.exports) {
     module.exports = { VM };
 }

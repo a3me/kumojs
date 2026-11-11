@@ -12,7 +12,7 @@ struct CompileResponse {
 fn compile() -> CompileResponse {
     let mut compiler = Compiler::new();
 
-    let compilation = compiler.compile_file(&Path::new("src/scripts/example.js"));
+    let compilation = compiler.compile_file(Path::new("src/scripts/example.js"));
 
     match compilation {
         Ok(bytecode) => CompileResponse {

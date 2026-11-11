@@ -643,33 +643,30 @@ impl<'a> Compiler<'a> {
         self.patch_jump(handler);
 
         let mut finally_handler = None;
-        match &stmt.handler {
-            Some(catch) => {
-                // the thrown value is on the stack
-                self.enter_scope();
-                match &catch.param {
-                    Some(pat) => {
-                        for ident in pat_idents(pat) {
-                            self.declare_variable(ident.sym.to_string())?;
-                        }
-                        self.compile_pattern(pat, true)?;
+        if let Some(catch) = &stmt.handler {
+            // the thrown value is on the stack
+            self.enter_scope();
+            match &catch.param {
+                Some(pat) => {
+                    for ident in pat_idents(pat) {
+                        self.declare_variable(ident.sym.to_string())?;
                     }
-                    None => self.emit_op(Operation::Pop),
+                    self.compile_pattern(pat, true)?;
                 }
-
-                if finally.is_some() {
-                    finally_handler = Some(self.emit_jump(Operation::TryStart(0)));
-                    self.push_try_region(finally);
-                }
-                self.compile_block(&catch.body)?;
-                if finally.is_some() {
-                    self.try_stack.pop();
-                    self.emit_op(Operation::TryEnd);
-                    to_normal_end.push(self.emit_jump(Operation::Jump(0)));
-                }
-                self.exit_scope();
+                None => self.emit_op(Operation::Pop),
             }
-            None => {}
+
+            if finally.is_some() {
+                finally_handler = Some(self.emit_jump(Operation::TryStart(0)));
+                self.push_try_region(finally);
+            }
+            self.compile_block(&catch.body)?;
+            if finally.is_some() {
+                self.try_stack.pop();
+                self.emit_op(Operation::TryEnd);
+                to_normal_end.push(self.emit_jump(Operation::Jump(0)));
+            }
+            self.exit_scope();
         }
 
         if let Some(finally) = finally {
