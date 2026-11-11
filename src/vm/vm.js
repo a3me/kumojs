@@ -1155,36 +1155,20 @@ class VM {
                     debug && this.log(`OP_DUP`, value);
                     break;
                 }
-                // Operation::Function => 0x37 (host-callable), 0x4b (internal: only called
-                // directly from VM code, so no host wrapper is made)
-                case 0x37:
+                // Operation::Function => 0x37 (host-callable) / 0x4b (internal: only called
+                // directly from VM code, so no host wrapper is made). The two opcodes share
+                // one decoder; the case decides whether to wrap, so no raw opcode value is
+                // read (which a renumbered build would get wrong).
+                case 0x37: {
+                    const func = this.readFunction();
+                    debug && this.log(`OP_FUNCTION name=${func.name} arity=${func.arity}`);
+                    this.push(this.createHostWrapper(func));
+                    break;
+                }
                 case 0x4b: {
-                    const arity = this.readUInt8();
-                    const params = this.readUInt8();
-                    const kind = this.readUInt8();
-                    const name = this.readString();
-                    const currentFrame = this.callStack[this.callStack.length - 1];
-                    // captures: count, then (from_local, index): a boxed local slot of this
-                    // frame, or one of this closure's own captures
-                    const captureCount = this.readUInt8();
-                    const captures = new Array(captureCount);
-                    for (let i = 0; i < captureCount; i++) {
-                        const fromLocal = this.readUInt8();
-                        const index = this.readUInt8();
-                        captures[i] = fromLocal
-                            ? currentFrame.locals[index]
-                            : currentFrame.func.captures[index];
-                    }
-                    const codeLen = this.readUInt32();
-                    const code = this.bytecode.subarray(this.ip + 1, this.ip + 1 + codeLen);
-                    this.ip += codeLen;
-
-                    const func = new VirtualFunction(arity, params, kind, name, code, captures);
-                    if (func.arrow) {
-                        func.argsFrame = currentFrame.argsFrame;
-                    }
-                    this.push(op === 0x37 ? this.createHostWrapper(func) : func);
-                    debug && this.log(`OP_FUNCTION name=${name} arity=${arity}`);
+                    const func = this.readFunction();
+                    debug && this.log(`OP_FUNCTION name=${func.name} arity=${func.arity} internal`);
+                    this.push(func);
                     break;
                 }
                 // Operation::GetUpvalue => 0x38,
@@ -1947,6 +1931,36 @@ class VM {
             }
         }
         this.printStack();
+    }
+
+    // Decode a Function instruction's operands into a VirtualFunction (shared by the
+    // host-callable and internal opcodes).
+    readFunction() {
+        const arity = this.readUInt8();
+        const params = this.readUInt8();
+        const kind = this.readUInt8();
+        const name = this.readString();
+        const currentFrame = this.callStack[this.callStack.length - 1];
+        // captures: count, then (from_local, index): a boxed local slot of this frame, or
+        // one of this closure's own captures
+        const captureCount = this.readUInt8();
+        const captures = new Array(captureCount);
+        for (let i = 0; i < captureCount; i++) {
+            const fromLocal = this.readUInt8();
+            const index = this.readUInt8();
+            captures[i] = fromLocal
+                ? currentFrame.locals[index]
+                : currentFrame.func.captures[index];
+        }
+        const codeLen = this.readUInt32();
+        const code = this.bytecode.subarray(this.ip + 1, this.ip + 1 + codeLen);
+        this.ip += codeLen;
+
+        const func = new VirtualFunction(arity, params, kind, name, code, captures);
+        if (func.arrow) {
+            func.argsFrame = currentFrame.argsFrame;
+        }
+        return func;
     }
 
     // ---- rarely used instructions, kept out of `execute` so it stays small for V8

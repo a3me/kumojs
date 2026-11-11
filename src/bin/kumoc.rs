@@ -1,5 +1,7 @@
 //! Compile a script to kumo bytecode: `kumoc <input.js> [output.kumo]` (stdout if no output).
 //! `kumoc --disasm <input.js>` prints a readable listing of the bytecode instead.
+//! `kumoc --embed <input.js> [output.js] [--seed N]` writes a standalone JS file: the VM with
+//! the program embedded (opcodes shuffled to a random seed unless `--seed` pins one).
 //! `kumoc --batch <list> <out-dir>` compiles every path listed (one per line) in parallel,
 //! writing `<n>.kumo` or the compile error as `<n>.err` for the n-th (test runners).
 use kumojs::Compiler;
@@ -17,6 +19,9 @@ fn main() -> ExitCode {
                 ExitCode::from(2)
             }
         };
+    }
+    if args.first().is_some_and(|a| a == "--embed") {
+        return embed(&args[1..]);
     }
     let disasm = args.first().is_some_and(|a| a == "--disasm");
     if disasm {
@@ -48,6 +53,52 @@ fn main() -> ExitCode {
     let written = match args.get(1) {
         Some(output) => std::fs::write(output, &bytecode),
         None => std::io::stdout().write_all(&bytecode),
+    };
+    if let Err(e) = written {
+        eprintln!("{e}");
+        return ExitCode::FAILURE;
+    }
+    ExitCode::SUCCESS
+}
+
+/// `--embed [--seed N] <input.js> [output.js]`: write a standalone VM+program JS file.
+fn embed(args: &[String]) -> ExitCode {
+    let mut seed: Option<u64> = None;
+    let mut positional: Vec<&String> = Vec::new();
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        if arg == "--seed" {
+            match it.next().and_then(|s| s.parse().ok()) {
+                Some(n) => seed = Some(n),
+                None => {
+                    eprintln!("usage: kumoc --embed <input.js> [output.js] [--seed N]");
+                    return ExitCode::from(2);
+                }
+            }
+        } else {
+            positional.push(arg);
+        }
+    }
+    let Some(input) = positional.first() else {
+        eprintln!("usage: kumoc --embed <input.js> [output.js] [--seed N]");
+        return ExitCode::from(2);
+    };
+    // a random seed by default, so each build renumbers the opcodes differently
+    let seed = seed.unwrap_or_else(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos() as u64)
+    });
+    let js = match kumojs::embed::compile_embedded_file(Path::new(input), seed) {
+        Ok(js) => js,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let written = match positional.get(1) {
+        Some(output) => std::fs::write(output, &js),
+        None => std::io::stdout().write_all(js.as_bytes()),
     };
     if let Err(e) = written {
         eprintln!("{e}");

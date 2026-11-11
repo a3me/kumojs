@@ -3,6 +3,8 @@ use std::collections::HashSet;
 use std::path::Path;
 use swc_common::sync::Lrc;
 pub mod disasm;
+pub mod embed;
+pub mod opcode;
 
 use std::cell::Cell;
 use swc_common::{BytePos, SourceFile, SourceMap, Span, Spanned};
@@ -61,6 +63,9 @@ pub struct Compiler<'a> {
     hoisting_fn: bool,
     /// compiling a class body: where its constructor / initialiser closures are made
     class_anchor: Option<BytePos>,
+    /// how emitted opcode bytes are renumbered (identity unless a seed shuffles them);
+    /// shared by every nested function so one script's bytecode is internally consistent
+    opcode_map: Lrc<opcode::OpcodeMap>,
 }
 
 /// Whether a function can suspend: generators (`yield`), async functions (`await`) or both.
@@ -585,145 +590,141 @@ struct FieldInit<'f> {
     name: Option<String>,
 }
 
-impl Operation {
-    fn get_opcode(&self) -> u8 {
-        match self {
-            Operation::LoadString(_) => 0x01,
-            Operation::LoadFloat64(_) => 0x02,
-            Operation::Bool(_) => 0x03,
-            Operation::Pop => 0x04,
-            Operation::Null => 0x05,
-            Operation::Regex(_, _) => 0x06,
-            Operation::Undefined => 0x07,
-            Operation::Return => 0x08,
-            Operation::UInt8(_) => 0x0b,
-            Operation::UInt16(_) => 0x0c,
-            Operation::UInt32(_) => 0x0d,
-            Operation::UInt64(_) => 0x0e,
-            Operation::Call => 0x0f,
-            Operation::GetProperty => 0x10,
-            Operation::SetProperty => 0x11,
-            Operation::EqEq => 0x12,
-            Operation::NotEq => 0x13,
-            Operation::EqEqEq => 0x14,
-            Operation::NotEqEq => 0x15,
-            Operation::Lt => 0x16,
-            Operation::LtEq => 0x17,
-            Operation::Gt => 0x18,
-            Operation::GtEq => 0x19,
-            Operation::LShift => 0x1a,
-            Operation::RShift => 0x1b,
-            Operation::ZeroFillRShift => 0x1c,
-            Operation::Add => 0x1d,
-            Operation::Sub => 0x1e,
-            Operation::Mul => 0x1f,
-            Operation::Div => 0x20,
-            Operation::Mod => 0x21,
-            Operation::BitOr => 0x22,
-            Operation::BitXor => 0x23,
-            Operation::BitAnd => 0x24,
-            Operation::In => 0x27,
-            Operation::InstanceOf => 0x28,
-            Operation::Exp => 0x29,
-            Operation::GetLocal(_) => 0x2b,
-            Operation::SetLocal(_) => 0x2c,
-            Operation::UnaryMinus => 0x2d,
-            Operation::UnaryPlus => 0x2e,
-            Operation::LogicalNot => 0x2f,
-            Operation::BitwiseNot => 0x30,
-            Operation::TypeOf => 0x31,
-            Operation::Void => 0x32,
-            Operation::Delete => 0x33,
-            Operation::Array(_) => 0x34,
-            Operation::Object(_) => 0x35,
-            Operation::Dup => 0x36,
-            Operation::Function(info) if info.internal => 0x4b,
-            Operation::Function(_) => 0x37,
-            Operation::GetUpvalue(_) => 0x38,
-            Operation::SetUpvalue(_) => 0x39,
-            Operation::Jump(_) => 0x3a,
-            Operation::JumpIfFalse(_) => 0x3b,
-            Operation::JumpIfTrue(_) => 0x3c,
-            Operation::JumpIfNotNullish(_) => 0x3d,
-            Operation::CallMethod => 0x3e,
-            Operation::This => 0x3f,
-            Operation::HostGlobal(_) => 0x40,
-            Operation::Loop(_) => 0x41,
-            Operation::Dup2 => 0x42,
-            Operation::Callee => 0x43,
-            Operation::Arguments => 0x44,
-            Operation::New => 0x45,
-            Operation::Throw => 0x46,
-            Operation::TryStart(_) => 0x47,
-            Operation::TryEnd => 0x48,
-            Operation::ForInKeys => 0x49,
-            Operation::Hole => 0x4a,
-            Operation::GetBox(_) => 0x4c,
-            Operation::SetBox(_) => 0x4d,
-            Operation::NewBox(_) => 0x4e,
-            Operation::BoxLocal(_) => 0x4f,
-            Operation::RenewBox(_) => 0x50,
-            Operation::ArrayAppend => 0x51,
-            Operation::ArraySpread => 0x52,
-            Operation::SpreadArgs => 0x53,
-            Operation::RestArgs(_) => 0x54,
-            Operation::IterTake(_) => 0x55,
-            Operation::ArraySliceFrom(_) => 0x56,
-            Operation::RequireObjectCoercible => 0x57,
-            Operation::ObjectRest => 0x58,
-            Operation::Template(_) => 0x59,
-            Operation::TemplateObject(_) => 0x5a,
-            Operation::DefineField => 0x5b,
-            Operation::DefineAccessor(_) => 0x5c,
-            Operation::ObjectSpread => 0x5d,
-            Operation::SetFunctionName(_) => 0x5e,
-            Operation::MakeClass(_) => 0x5f,
-            Operation::DefineMethod(_) => 0x60,
-            Operation::ClassField => 0x61,
-            Operation::StaticField => 0x62,
-            Operation::StaticBlock => 0x63,
-            Operation::SuperCall => 0x64,
-            Operation::SuperGet => 0x65,
-            Operation::SuperSet => 0x66,
-            Operation::NewTarget => 0x67,
-            Operation::NewPrivateName(_) => 0x68,
-            Operation::PrivateGet => 0x69,
-            Operation::PrivateSet => 0x6a,
-            Operation::PrivateIn => 0x6b,
-            Operation::DefinePrivateMethod(_) => 0x6c,
-            Operation::LoadBigInt(_) => 0x6d,
-            Operation::Increment => 0x6e,
-            Operation::Decrement => 0x6f,
-            Operation::ToNumeric => 0x70,
-            Operation::GetIterator => 0x71,
-            Operation::IterNext(..) => 0x72,
-            Operation::IterClose(..) => 0x73,
-            Operation::JumpIfNullish(_) => 0x74,
-            Operation::InitialYield => 0x75,
-            Operation::Yield(_) => 0x76,
-            Operation::Await => 0x77,
-            Operation::GetAsyncIterator => 0x78,
-            Operation::DelegateCall(..) => 0x79,
-            Operation::DelegateResult(..) => 0x7a,
-            Operation::AsyncIterNext(_) => 0x7b,
-            Operation::IterResult(..) => 0x7c,
-            Operation::AsyncIterClose(..) => 0x7d,
-            Operation::IterCloseCheck(_) => 0x7e,
-            Operation::ToPropertyKey => 0x7f,
-            Operation::InitInstance => 0x80,
-            Operation::SuperCallFinish => 0x81,
-            Operation::InitField(..) => 0x82,
-            Operation::ClassInit => 0x83,
-            Operation::GetSlotIndex(..) => 0x84,
-            Operation::GetSlotProp(..) => 0x85,
-            Operation::NewBoxTdz(_) => 0x86,
-            Operation::Tdz(_) => 0x87,
-            Operation::CheckTdz => 0x88,
-            Operation::ThrowTdz => 0x89,
-        }
-    }
+#[rustfmt::skip]
+opcode::opcodes! {
+    LoadString(..)            => 0x01, [Str];
+    LoadFloat64(..)           => 0x02, [F64];
+    Bool(..)                  => 0x03, [U8];
+    Pop                       => 0x04, [];
+    Null                      => 0x05, [];
+    Regex(..)                 => 0x06, [Str, Str];
+    Undefined                 => 0x07, [];
+    Return                    => 0x08, [];
+    UInt8(..)                 => 0x0b, [U8];
+    UInt16(..)                => 0x0c, [U16];
+    UInt32(..)                => 0x0d, [U32];
+    UInt64(..)                => 0x0e, [U32, U32];
+    Call                      => 0x0f, [];
+    GetProperty               => 0x10, [];
+    SetProperty               => 0x11, [];
+    EqEq                      => 0x12, [];
+    NotEq                     => 0x13, [];
+    EqEqEq                    => 0x14, [];
+    NotEqEq                   => 0x15, [];
+    Lt                        => 0x16, [];
+    LtEq                      => 0x17, [];
+    Gt                        => 0x18, [];
+    GtEq                      => 0x19, [];
+    LShift                    => 0x1a, [];
+    RShift                    => 0x1b, [];
+    ZeroFillRShift            => 0x1c, [];
+    Add                       => 0x1d, [];
+    Sub                       => 0x1e, [];
+    Mul                       => 0x1f, [];
+    Div                       => 0x20, [];
+    Mod                       => 0x21, [];
+    BitOr                     => 0x22, [];
+    BitXor                    => 0x23, [];
+    BitAnd                    => 0x24, [];
+    In                        => 0x27, [];
+    InstanceOf                => 0x28, [];
+    Exp                       => 0x29, [];
+    GetLocal(..)              => 0x2b, [U8];
+    SetLocal(..)              => 0x2c, [U8];
+    UnaryMinus                => 0x2d, [];
+    UnaryPlus                 => 0x2e, [];
+    LogicalNot                => 0x2f, [];
+    BitwiseNot                => 0x30, [];
+    TypeOf                    => 0x31, [];
+    Void                      => 0x32, [];
+    Delete                    => 0x33, [];
+    Array(..)                 => 0x34, [U32];
+    Object(..)                => 0x35, [U32];
+    Dup                       => 0x36, [];
+    Function(info) if info.internal => 0x4b, [];
+    Function(..)              => 0x37, [];
+    GetUpvalue(..)            => 0x38, [U8];
+    SetUpvalue(..)            => 0x39, [U8];
+    Jump(..)                  => 0x3a, [Jump];
+    JumpIfFalse(..)           => 0x3b, [Jump];
+    JumpIfTrue(..)            => 0x3c, [Jump];
+    JumpIfNotNullish(..)      => 0x3d, [Jump];
+    CallMethod                => 0x3e, [];
+    This                      => 0x3f, [];
+    HostGlobal(..)            => 0x40, [U8];
+    Loop(..)                  => 0x41, [Back];
+    Dup2                      => 0x42, [];
+    Callee                    => 0x43, [];
+    Arguments                 => 0x44, [];
+    New                       => 0x45, [];
+    Throw                     => 0x46, [];
+    TryStart(..)              => 0x47, [Jump];
+    TryEnd                    => 0x48, [];
+    ForInKeys                 => 0x49, [];
+    Hole                      => 0x4a, [];
+    GetBox(..)                => 0x4c, [U8];
+    SetBox(..)                => 0x4d, [U8];
+    NewBox(..)                => 0x4e, [U8];
+    BoxLocal(..)              => 0x4f, [U8];
+    RenewBox(..)              => 0x50, [U8];
+    ArrayAppend               => 0x51, [];
+    ArraySpread               => 0x52, [];
+    SpreadArgs                => 0x53, [];
+    RestArgs(..)              => 0x54, [U8];
+    IterTake(..)              => 0x55, [U32];
+    ArraySliceFrom(..)        => 0x56, [U32];
+    RequireObjectCoercible    => 0x57, [];
+    ObjectRest                => 0x58, [];
+    Template(..)              => 0x59, [U32];
+    TemplateObject(..)        => 0x5a, [];
+    DefineField               => 0x5b, [];
+    DefineAccessor(..)        => 0x5c, [U8];
+    ObjectSpread              => 0x5d, [];
+    SetFunctionName(..)       => 0x5e, [U8];
+    MakeClass(..)             => 0x5f, [U8];
+    DefineMethod(..)          => 0x60, [U8];
+    ClassField                => 0x61, [];
+    StaticField               => 0x62, [];
+    StaticBlock               => 0x63, [];
+    SuperCall                 => 0x64, [];
+    SuperGet                  => 0x65, [];
+    SuperSet                  => 0x66, [];
+    NewTarget                 => 0x67, [];
+    NewPrivateName(..)        => 0x68, [U8];
+    PrivateGet                => 0x69, [];
+    PrivateSet                => 0x6a, [];
+    PrivateIn                 => 0x6b, [];
+    DefinePrivateMethod(..)   => 0x6c, [U8];
+    LoadBigInt(..)            => 0x6d, [Str];
+    Increment                 => 0x6e, [];
+    Decrement                 => 0x6f, [];
+    ToNumeric                 => 0x70, [];
+    GetIterator               => 0x71, [];
+    IterNext(..)              => 0x72, [U8, Jump];
+    IterClose(..)             => 0x73, [U8, U8];
+    JumpIfNullish(..)         => 0x74, [Jump];
+    InitialYield              => 0x75, [];
+    Yield(..)                 => 0x76, [U8, JumpFromEnd, JumpFromEnd, JumpFromEnd];
+    Await                     => 0x77, [];
+    GetAsyncIterator          => 0x78, [];
+    DelegateCall(..)          => 0x79, [U8, U8, Jump];
+    DelegateResult(..)        => 0x7a, [U8, U8, JumpFromEnd, JumpFromEnd];
+    AsyncIterNext(..)         => 0x7b, [U8];
+    IterResult(..)            => 0x7c, [U8, Jump];
+    AsyncIterClose(..)        => 0x7d, [U8, U8, Jump];
+    IterCloseCheck(..)        => 0x7e, [U8];
+    ToPropertyKey             => 0x7f, [];
+    InitInstance              => 0x80, [];
+    SuperCallFinish           => 0x81, [];
+    InitField(..)             => 0x82, [U32, U8];
+    ClassInit                 => 0x83, [];
+    GetSlotIndex(..)          => 0x84, [U8, U32];
+    GetSlotProp(..)           => 0x85, [U8, Str];
+    NewBoxTdz(..)             => 0x86, [U8];
+    Tdz(..)                   => 0x87, [U8];
+    CheckTdz                  => 0x88, [];
+    ThrowTdz                  => 0x89, [];
 }
-
 fn load_str(s: &str) -> Operation {
     Operation::LoadString(s.as_bytes().to_vec())
 }
@@ -749,12 +750,15 @@ impl<'a> Compiler<'a> {
             in_switch: false,
             hoisting_fn: false,
             class_anchor: None,
+            opcode_map: Lrc::new(opcode::OpcodeMap::identity()),
         }
     }
 
     fn new_enclosing(enclosing: &'a Compiler<'a>) -> Compiler<'a> {
         Compiler {
             enclosing: Some(enclosing),
+            // nested functions must use the same numbering as the script they're part of
+            opcode_map: enclosing.opcode_map.clone(),
             ..Compiler::new()
         }
     }
@@ -775,6 +779,18 @@ impl<'a> Compiler<'a> {
             source.to_string(),
         );
         self.parse_and_compile(&cm, &fm)
+    }
+
+    /// Set the opcode numbering for this compilation (and its nested functions). Seed 0 is
+    /// a shuffle too; use `compile_source` / `compile_file` for the canonical numbering.
+    pub fn with_opcode_map(mut self, map: opcode::OpcodeMap) -> Self {
+        self.opcode_map = Lrc::new(map);
+        self
+    }
+
+    /// The `OpcodeMap` this compiler emits under (so a matching VM can be generated).
+    pub fn opcode_map(&self) -> &opcode::OpcodeMap {
+        &self.opcode_map
     }
 
     fn parse_and_compile(&mut self, cm: &SourceMap, fm: &SourceFile) -> CompileResult<Vec<u8>> {
@@ -3622,7 +3638,7 @@ impl<'a> Compiler<'a> {
     }
 
     fn emit_op(&mut self, op: Operation) {
-        self.bytecode.push(op.get_opcode());
+        self.bytecode.push(self.opcode_map.to_byte[op.get_opcode() as usize]);
         match op {
             Operation::LoadString(bytes) => self.emit_string(&bytes),
             Operation::LoadBigInt(digits) => self.emit_string(digits.as_bytes()),
