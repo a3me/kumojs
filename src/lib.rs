@@ -1,12 +1,21 @@
+use std::cell::RefCell;
+use std::collections::HashSet;
 use std::path::Path;
 use swc_common::sync::Lrc;
-use swc_common::{SourceFile, SourceMap, Span, Spanned};
+pub mod disasm;
+
+use std::cell::Cell;
+use swc_common::{BytePos, SourceFile, SourceMap, Span, Spanned};
 use swc_ecma_ast::{
-    ArrayLit, ArrayPat, ArrowExpr, AssignExpr, AssignOp, AssignTarget, AssignTargetPat, BinExpr,
-    BinaryOp, BlockStmt, CallExpr, Callee, Class, CondExpr, Decl, DoWhileStmt, Expr, FnDecl,
-    ForHead, ForInStmt, ForStmt, Function, Ident, IfStmt, LabeledStmt, Lit, MemberExpr,
-    MemberProp, Module, ModuleItem, NewExpr, ObjectLit, Pat, Prop, PropName, PropOrSpread,
-    SimpleAssignTarget, Stmt, SwitchStmt, TryStmt, UnaryExpr, UnaryOp, UpdateExpr, UpdateOp,
+    ArrayLit, ArrayPat, ArrowExpr, ArrowFunctionBody, AssignExpr, AssignOp, AssignTarget,
+    AssignTargetPat, BinExpr, BinaryOp, BlockStmt, CallExpr, Callee, Class, ClassMember, ClassProp,
+    CondExpr, Constructor, Decl, DoWhileStmt, Expr, ExprOrSpread, FnDecl, ForHead, ForInStmt, ForOfStmt,
+    ForStmt, Function, Ident, IfStmt, LabeledStmt, Lit, MemberExpr, MemberProp, MetaPropKind,
+    MethodKind, Module, ModuleItem, NewExpr, ObjectLit, ObjectPat, ObjectPatProp, OptChainBase,
+    OptChainExpr,
+    ParamOrTsParamProp, Pat, PrivateName, PrivateProp, Prop, PropName, PropOrSpread,
+    SimpleAssignTarget, StaticBlock, Stmt,
+    SuperProp, SwitchStmt, TaggedTpl, Tpl, TryStmt, UnaryExpr, UnaryOp, UpdateExpr, UpdateOp, YieldExpr,
     VarDecl, VarDeclKind, VarDeclOrExpr, VarDeclarator, WhileStmt,
 };
 use swc_ecma_parser::{lexer::Lexer, Parser, StringInput, Syntax};
@@ -30,6 +39,54 @@ pub struct Compiler<'a> {
     /// scratch slot for short-lived values (never live across nested evaluation)
     temp_slot: Option<u8>,
     enclosing: Option<&'a Compiler<'a>>,
+    /// names used anywhere inside functions nested in this one; locals with these names
+    /// are kept in boxes so closures can share them (see `captured_names`)
+    captured_names: HashSet<String>,
+    /// variables this function captures, in capture-index order: `(from_local, index)`,
+    /// where `from_local` means a boxed local slot of the enclosing function and otherwise
+    /// one of the enclosing function's own captures
+    upvalues: RefCell<Vec<(bool, u8)>>,
+    /// compiling an arrow function: `this` and `arguments` come from the enclosing function
+    is_arrow: bool,
+    /// compiling a generator / async function (`yield` / `await` suspend it)
+    coroutine: Coroutine,
+    /// where this function's closure is made in the enclosing function's source (0 for
+    /// hoisted function declarations: they exist from the start of their scope)
+    created_at: BytePos,
+    /// `created_at` for the next closure compiled in this function
+    next_anchor: Option<BytePos>,
+    /// declaring a `switch` body's names (their uses always check the dead zone)
+    in_switch: bool,
+    /// compiling a hoisted function declaration (its closure exists from the scope's start)
+    hoisting_fn: bool,
+    /// compiling a class body: where its constructor / initialiser closures are made
+    class_anchor: Option<BytePos>,
+}
+
+/// Whether a function can suspend: generators (`yield`), async functions (`await`) or both.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Coroutine {
+    None,
+    Generator,
+    Async,
+    AsyncGenerator,
+}
+
+impl Coroutine {
+    fn of(is_generator: bool, is_async: bool) -> Self {
+        match (is_generator, is_async) {
+            (false, false) => Coroutine::None,
+            (true, false) => Coroutine::Generator,
+            (false, true) => Coroutine::Async,
+            (true, true) => Coroutine::AsyncGenerator,
+        }
+    }
+    fn is_generator(self) -> bool {
+        matches!(self, Coroutine::Generator | Coroutine::AsyncGenerator)
+    }
+    fn is_async(self) -> bool {
+        matches!(self, Coroutine::Async | Coroutine::AsyncGenerator)
+    }
 }
 
 #[derive(Error, Debug)]
@@ -43,6 +100,13 @@ pub enum CompileError {
     /// `location` is filled in (as " at file:line:col") once the span is resolved against the source map
     #[error("unsupported {what}{location}")]
     Unsupported {
+        what: String,
+        span: Span,
+        location: String,
+    },
+    /// an early error the parser doesn't check (e.g. redeclaring a `let`)
+    #[error("syntax error: {what}{location}")]
+    SyntaxError {
         what: String,
         span: Span,
         location: String,
@@ -68,6 +132,71 @@ struct Local {
     name: String,
     depth: usize,
     slot: u8,
+    /// used by a nested function: the slot holds a box shared with closures
+    captured: bool,
+    /// `const` (or a named function expression's own name): assigning to it throws
+    read_only: bool,
+    /// a class's hidden slot for a private name (`#x`), holding the VM's private name object
+    private: Option<PrivateKind>,
+    /// `let` / `const` / `class`: reading or writing it before its declaration runs throws
+    tdz: Option<Tdz>,
+}
+
+/// When a lexical binding may be used before it's initialised (its temporal dead zone).
+/// Uses in the same function are decided at compile time: before the declaration they
+/// always throw, after it they never do. Only closures that can exist before it (hoisted
+/// functions, or ones written earlier) check at run time, and only then does the binding
+/// start out holding the VM's "uninitialised" value. `switch` case declarations can be
+/// jumped over, so every use of them checks.
+struct Tdz {
+    /// where the declaration ends: it's initialised once this point runs
+    decl_end: BytePos,
+    /// every use checks at run time (`switch` cases)
+    always: bool,
+    /// where the binding's box is made (`NewBox`), to turn into `NewBoxTdz` if needed
+    box_at: Option<usize>,
+    /// a closure checks it at run time, so it must start uninitialised
+    needed: Cell<bool>,
+}
+
+/// How a use of a variable deals with the temporal dead zone.
+#[derive(PartialEq)]
+enum TdzUse {
+    /// can't be uninitialised here
+    Free,
+    /// always before the declaration: throws
+    Throw,
+    /// check at run time
+    Check,
+}
+
+/// What a private name (`#x`) declares. Known at compile time because private names are
+/// always declared in an enclosing class body.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum PrivateKind {
+    Field = 0,
+    Method = 1,
+    /// a getter and / or setter
+    Accessor = 2,
+}
+
+/// How a member expression's key is read and written.
+#[derive(Clone, Copy)]
+enum Access {
+    /// `obj.x` / `obj[x]`: the key is on the stack
+    Property,
+    /// `obj.#x`: the private name object is on the stack
+    Private(PrivateKind),
+}
+
+/// Where a variable lives, from the point of view of the function using it.
+enum VarRef {
+    /// a plain local slot
+    Local(u8),
+    /// a local slot holding a box (the variable is captured by a nested function)
+    Box(u8),
+    /// one of the running closure's captured boxes
+    Upvalue(u8),
 }
 
 #[derive(PartialEq)]
@@ -87,12 +216,18 @@ struct Breakable {
     continues: Vec<usize>,
     /// `try_stack` length when the statement started
     try_depth: usize,
+    /// a `for-of` loop: the try region right above `try_depth` closes its iterator, which
+    /// `continue` must leave in place
+    iter_region: bool,
 }
 
 /// A protected `try` (or `catch`, when there's a `finally`) region. Leaving it early with
 /// `break` / `continue` / `return` must drop its handler and run its `finally`.
 struct TryRegion {
     finally: Option<BlockStmt>,
+    /// a `for-of` body instead: the slot of the iterator to close (`return()`) on early
+    /// exit, and whether it's a `for await` (closing awaits)
+    close_iterator: Option<(u8, bool)>,
     /// scope at the `try` statement, so the inlined `finally` resolves names correctly
     locals_len: usize,
     scope_depth: usize,
@@ -214,13 +349,12 @@ enum Operation {
     Object(u32),
     /// Duplicate the top value on the stack
     Dup,
-    /// Create a virtual function: arity, name, code, internal. An internal function is only
-    /// ever called directly from VM code, so it gets no host wrapper (see `fn_escapes`).
-    Function(u8, String, Vec<u8>, bool),
-    /// Get variable from enclosing scope: depth, index
-    GetUpvalue(u8, u8),
-    /// Set variable in enclosing scope: depth, index
-    SetUpvalue(u8, u8),
+    /// Create a closure (see `FnInfo`)
+    Function(FnInfo),
+    /// Get a captured variable of the running closure: capture index
+    GetUpvalue(u8),
+    /// Set a captured variable of the running closure: capture index
+    SetUpvalue(u8),
     /// obj.f(): stack is [obj, f, ...args, argc]; calls f with obj as `this`
     CallMethod,
     /// `this`
@@ -255,6 +389,200 @@ enum Operation {
     ForInKeys,
     /// An array literal hole (`[1, , 3]`)
     Hole,
+    /// Read a boxed (captured) local
+    GetBox(u8),
+    /// Write a boxed (captured) local, leaving the value on the stack
+    SetBox(u8),
+    /// Put a fresh box holding `undefined` in a slot (a captured variable's scope starts)
+    NewBox(u8),
+    /// Box the value already in a slot (captured parameters)
+    BoxLocal(u8),
+    /// Replace a slot's box with a fresh one holding the same value (per-iteration `let`)
+    RenewBox(u8),
+    /// [arr, value] -> [arr] with value appended (a `Hole` just extends the length)
+    ArrayAppend,
+    /// [arr, iterable] -> [arr] with every iterated value appended (`...x`)
+    ArraySpread,
+    /// [args array] -> [...args, argc] for a call with spread arguments
+    SpreadArgs,
+    /// Push an array of the call's arguments from this index on (rest parameter)
+    RestArgs(u8),
+    /// Replace an iterable with an array of its first n values (`ITER_TAKE_ALL`: every
+    /// value), closing the iterator if it isn't done; arrays are used as they are
+    IterTake(u32),
+    /// Replace an array with its elements from an index on (array pattern rest)
+    ArraySliceFrom(u32),
+    /// Throw a `TypeError` if the top of the stack is `null` / `undefined` (does not pop)
+    RequireObjectCoercible,
+    /// [obj, keys] -> [copy of obj's own enumerable properties not in keys]
+    ObjectRest,
+    /// Join n parts (strings and values, alternating, string first) as a template does
+    Template(u32),
+    /// Push the strings array for a tagged template: (cooked, raw) per piece, cooked
+    /// `None` for an invalid escape. The same array is reused each time this site runs.
+    TemplateObject(Vec<(Option<Vec<u8>>, Vec<u8>)>),
+    /// [obj, key, value] -> [obj] with an own data property (object literal)
+    DefineField,
+    /// [obj, key, fn] -> [obj] with fn as the property's getter (0) or setter (1)
+    DefineAccessor(u8),
+    /// [obj, source] -> [obj] with source's own enumerable properties copied (`...source`)
+    ObjectSpread,
+    /// [key, fn] (not popped): name fn after a computed key, prefixed by 1 `get ` / 2 `set `
+    SetFunctionName(u8),
+    /// [superclass if 1, constructor] -> [class]: link prototypes, lock `prototype`
+    MakeClass(u8),
+    /// [target, key, fn] -> []: a non-enumerable method (0), getter (1) or setter (2)
+    DefineMethod(u8),
+    /// [class, key] -> []: an instance field's key (in order); `ClassInit` sets up values
+    ClassField,
+    /// [class, key, init or undefined] -> []: define a static field now
+    StaticField,
+    /// [class, fn] -> []: run a static block with `this` as the class
+    StaticBlock,
+    /// [...args, argc] -> [this]: call the parent constructor (`super(...)`)
+    SuperCall,
+    /// [key] -> [value]: `super[key]`
+    SuperGet,
+    /// [key, value] -> [value]: `super[key] = value`
+    SuperSet,
+    /// `new.target`
+    NewTarget,
+    /// Push a new private name for a class body (a `PrivateKind`)
+    NewPrivateName(u8),
+    /// [obj, name] -> [value]: `obj.#x` (a private getter is called)
+    PrivateGet,
+    /// [obj, name, value] -> [value]: `obj.#x = value`. A private setter is called with
+    /// the value left under its result: [value, result], so the compiler pops after it.
+    PrivateSet,
+    /// [name, obj] -> [bool]: `#x in obj`
+    PrivateIn,
+    /// [class, name, fn] -> []: a private method (0), getter (1) or setter (2), `| 4` static
+    DefinePrivateMethod(u8),
+    /// a BigInt literal, as its decimal digits
+    LoadBigInt(String),
+    /// `x + 1` after converting x to a number (a BigInt steps by `1n`)
+    Increment,
+    /// `x - 1` after converting x to a number (a BigInt steps by `1n`)
+    Decrement,
+    /// Jump forward by offset if top of stack is null/undefined (does not pop)
+    JumpIfNullish(u32),
+    /// A generator's start (after its parameters): suspend, giving the caller the
+    /// generator object
+    InitialYield,
+    /// [value] -> suspend, giving the caller `{ value, done: false }` (or the value itself
+    /// when raw = 1). Three u32 offsets from the end of the instruction say where to resume
+    /// for `next(v)`, `throw(e)` and `return(v)`; the sent value is pushed.
+    Yield(u8),
+    /// [value] -> suspend until the value settles, then push the result. A rejection
+    /// resumes at the instruction after (a `Throw`), a fulfilment after that.
+    Await,
+    /// [iterable] -> [async iterator record] (`for await`, async `yield*`)
+    GetAsyncIterator,
+    /// `yield*`: [received] -> [inner result]: call the iterator record's next / throw /
+    /// return (by the mode slot) with it. Without a `return` method a return jumps
+    /// forward with the received value.
+    DelegateCall(u8, u8, u32),
+    /// `yield*`: [inner result] -> [result to yield] (async: its value); when done, its
+    /// value jumps to the first offset (or the second, for a return)
+    DelegateResult(u8, u8),
+    /// `for await`: [iterator record slot] -> [promise of the next result]
+    AsyncIterNext(u8),
+    /// [result] -> [value], or jump forward by the offset when it's done (marking the
+    /// record in the slot done)
+    IterResult(u8, u32),
+    /// `for await` closing: call the record's `return()` and push its result, or jump
+    /// forward when there's nothing to await; mode 1 (leaving by a throw) ignores errors
+    AsyncIterClose(u8, u8, u32),
+    /// [awaited return() result] -> []: must be an object (mode 0)
+    IterCloseCheck(u8),
+    /// [key] -> [property key]: a string or symbol, converted the way JS does
+    ToPropertyKey,
+    /// Put a fresh box holding the "uninitialised" value in a slot (see `Tdz`)
+    NewBoxTdz(u8),
+    /// Put the "uninitialised" value in a slot (a `switch` case's `let`)
+    Tdz(u8),
+    /// Throw a `ReferenceError` if the top of the stack is the "uninitialised" value
+    CheckTdz,
+    /// Throw a `ReferenceError`: a variable used before its declaration
+    ThrowTdz,
+    /// [] -> [slot value[n]] (array destructuring)
+    GetSlotIndex(u8, u32),
+    /// [] -> [slot value.name] (object destructuring)
+    GetSlotProp(u8, Vec<u8>),
+    /// [] -> [this]: set up a new instance's private methods and fields (start of a base
+    /// class constructor); the fields' method runs in this loop and gives back `this`
+    InitInstance,
+    /// [parent constructor's result] -> [this]: bind `this` after `super(...)`, then set up
+    /// the instance like `InitInstance`
+    SuperCallFinish,
+    /// [value] -> []: define instance field n (its key is from the class) on `this`; 1 names
+    /// an anonymous function value after a computed key
+    InitField(u32, u8),
+    /// [class, fn] -> []: the class's instance field method
+    ClassInit,
+    /// [iterable] -> [iterator record] (`for-of`)
+    GetIterator,
+    /// Step the iterator record in a slot: push its next value, or jump forward by the
+    /// offset when it's done
+    IterNext(u8, u32),
+    /// Close the iterator record in a slot (call its `return()`) unless it's done; mode 1
+    /// (leaving by a throw) ignores errors from `return()`
+    IterClose(u8, u8),
+    /// convert to a number, keeping a BigInt as it is (the old value of `x++`)
+    ToNumeric,
+}
+
+/// `IterTake` count meaning "take every value".
+const ITER_TAKE_ALL: u32 = u32::MAX;
+
+/// A closure to create. An `internal` function is only ever called directly from VM code,
+/// so it gets no host wrapper (see `fn_escapes`).
+#[derive(Debug)]
+struct FnInfo {
+    /// the function's `length`: parameters before the first default or rest
+    length: u8,
+    /// parameter slots filled from the call's arguments
+    params: u8,
+    kind: FnKind,
+    coroutine: Coroutine,
+    internal: bool,
+    name: String,
+    /// `(from_local, index)` pairs, see `Compiler::upvalues`
+    captures: Vec<(bool, u8)>,
+    code: Vec<u8>,
+}
+
+/// Arrows take `this` and `arguments` from where they're created; arrows and methods
+/// (object literal methods, getters, setters) can't be used with `new`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum FnKind {
+    Normal = 0,
+    Arrow = 1,
+    Method = 2,
+    /// class constructors: only callable with `new`
+    BaseClass = 3,
+    /// a derived class's `this` comes from its `super(...)` call
+    DerivedClass = 4,
+}
+
+/// A function or arrow function's body.
+enum FnBody<'f> {
+    Block(&'f [Stmt]),
+    /// an arrow function's expression body
+    Expr(&'f Expr),
+    /// a class field initialiser: returns the value, named after the field if anonymous
+    Field(&'f Expr, Option<String>),
+    /// a derived class's implicit `constructor(...args) { super(...args); }`
+    DefaultDerived,
+    /// a class's instance field initialisers, run in order with `this` as the new instance
+    InstanceFields(&'f [FieldInit<'f>]),
+}
+
+/// An instance field for `FnBody::InstanceFields`: its value (`None` for `x;`), and the
+/// name an anonymous function value gets (`None`: from its computed key, at run time).
+struct FieldInit<'f> {
+    value: Option<&'f Expr>,
+    name: Option<String>,
 }
 
 impl Operation {
@@ -309,10 +637,10 @@ impl Operation {
             Operation::Array(_) => 0x34,
             Operation::Object(_) => 0x35,
             Operation::Dup => 0x36,
-            Operation::Function(_, _, _, false) => 0x37,
-            Operation::Function(_, _, _, true) => 0x4b,
-            Operation::GetUpvalue(_, _) => 0x38,
-            Operation::SetUpvalue(_, _) => 0x39,
+            Operation::Function(info) if info.internal => 0x4b,
+            Operation::Function(_) => 0x37,
+            Operation::GetUpvalue(_) => 0x38,
+            Operation::SetUpvalue(_) => 0x39,
             Operation::Jump(_) => 0x3a,
             Operation::JumpIfFalse(_) => 0x3b,
             Operation::JumpIfTrue(_) => 0x3c,
@@ -330,6 +658,68 @@ impl Operation {
             Operation::TryEnd => 0x48,
             Operation::ForInKeys => 0x49,
             Operation::Hole => 0x4a,
+            Operation::GetBox(_) => 0x4c,
+            Operation::SetBox(_) => 0x4d,
+            Operation::NewBox(_) => 0x4e,
+            Operation::BoxLocal(_) => 0x4f,
+            Operation::RenewBox(_) => 0x50,
+            Operation::ArrayAppend => 0x51,
+            Operation::ArraySpread => 0x52,
+            Operation::SpreadArgs => 0x53,
+            Operation::RestArgs(_) => 0x54,
+            Operation::IterTake(_) => 0x55,
+            Operation::ArraySliceFrom(_) => 0x56,
+            Operation::RequireObjectCoercible => 0x57,
+            Operation::ObjectRest => 0x58,
+            Operation::Template(_) => 0x59,
+            Operation::TemplateObject(_) => 0x5a,
+            Operation::DefineField => 0x5b,
+            Operation::DefineAccessor(_) => 0x5c,
+            Operation::ObjectSpread => 0x5d,
+            Operation::SetFunctionName(_) => 0x5e,
+            Operation::MakeClass(_) => 0x5f,
+            Operation::DefineMethod(_) => 0x60,
+            Operation::ClassField => 0x61,
+            Operation::StaticField => 0x62,
+            Operation::StaticBlock => 0x63,
+            Operation::SuperCall => 0x64,
+            Operation::SuperGet => 0x65,
+            Operation::SuperSet => 0x66,
+            Operation::NewTarget => 0x67,
+            Operation::NewPrivateName(_) => 0x68,
+            Operation::PrivateGet => 0x69,
+            Operation::PrivateSet => 0x6a,
+            Operation::PrivateIn => 0x6b,
+            Operation::DefinePrivateMethod(_) => 0x6c,
+            Operation::LoadBigInt(_) => 0x6d,
+            Operation::Increment => 0x6e,
+            Operation::Decrement => 0x6f,
+            Operation::ToNumeric => 0x70,
+            Operation::GetIterator => 0x71,
+            Operation::IterNext(..) => 0x72,
+            Operation::IterClose(..) => 0x73,
+            Operation::JumpIfNullish(_) => 0x74,
+            Operation::InitialYield => 0x75,
+            Operation::Yield(_) => 0x76,
+            Operation::Await => 0x77,
+            Operation::GetAsyncIterator => 0x78,
+            Operation::DelegateCall(..) => 0x79,
+            Operation::DelegateResult(..) => 0x7a,
+            Operation::AsyncIterNext(_) => 0x7b,
+            Operation::IterResult(..) => 0x7c,
+            Operation::AsyncIterClose(..) => 0x7d,
+            Operation::IterCloseCheck(_) => 0x7e,
+            Operation::ToPropertyKey => 0x7f,
+            Operation::InitInstance => 0x80,
+            Operation::SuperCallFinish => 0x81,
+            Operation::InitField(..) => 0x82,
+            Operation::ClassInit => 0x83,
+            Operation::GetSlotIndex(..) => 0x84,
+            Operation::GetSlotProp(..) => 0x85,
+            Operation::NewBoxTdz(_) => 0x86,
+            Operation::Tdz(_) => 0x87,
+            Operation::CheckTdz => 0x88,
+            Operation::ThrowTdz => 0x89,
         }
     }
 }
@@ -350,6 +740,15 @@ impl<'a> Compiler<'a> {
             pending_labels: Vec::new(),
             temp_slot: None,
             enclosing: None,
+            captured_names: HashSet::new(),
+            upvalues: RefCell::new(Vec::new()),
+            is_arrow: false,
+            coroutine: Coroutine::None,
+            created_at: BytePos(0),
+            next_anchor: None,
+            in_switch: false,
+            hoisting_fn: false,
+            class_anchor: None,
         }
     }
 
@@ -389,7 +788,11 @@ impl<'a> Compiler<'a> {
 
         // parsed as a module, so input is always strict mode
         let parse_error = |e: swc_ecma_parser::error::Error| {
-            CompileError::ParseError(format!("{}{}", e.kind().msg(), format_location(cm, e.span())))
+            CompileError::ParseError(format!(
+                "{}{}",
+                e.kind().msg(),
+                format_location(cm, e.span())
+            ))
         };
         let module = parser.parse_module().map_err(parse_error)?;
         if let Some(e) = parser.take_errors().into_iter().next() {
@@ -398,6 +801,11 @@ impl<'a> Compiler<'a> {
 
         self.compile(&module).map_err(|e| match e {
             CompileError::Unsupported { what, span, .. } => CompileError::Unsupported {
+                what,
+                span,
+                location: format_location(cm, span),
+            },
+            CompileError::SyntaxError { what, span, .. } => CompileError::SyntaxError {
                 what,
                 span,
                 location: format_location(cm, span),
@@ -415,7 +823,9 @@ impl<'a> Compiler<'a> {
             }
         }
         // the module body behaves like a function body
+        self.captured_names = captured_names(&[], &FnBody::Block(&[]), &stmts);
         self.compile_body(&stmts, true, true)?;
+        self.patch_tdz(0);
         Ok(self.bytecode.clone())
     }
 
@@ -425,7 +835,12 @@ impl<'a> Compiler<'a> {
 
     /// Compile a list of statements forming a function body or block.
     /// `leave_last` keeps the last expression statement's value on the stack (module body).
-    fn compile_body(&mut self, stmts: &[&Stmt], hoist_vars: bool, leave_last: bool) -> CompileResult {
+    fn compile_body(
+        &mut self,
+        stmts: &[&Stmt],
+        hoist_vars: bool,
+        leave_last: bool,
+    ) -> CompileResult {
         self.hoist_declarations(stmts, hoist_vars)?;
         let last = stmts.len().saturating_sub(1);
         for (i, stmt) in stmts.iter().enumerate() {
@@ -449,13 +864,18 @@ impl<'a> Compiler<'a> {
             }
         }
 
+        self.check_redeclarations(stmts, hoist_vars)?;
         for stmt in stmts {
             match stmt {
                 Stmt::Decl(Decl::Var(var_decl)) if var_decl.kind != VarDeclKind::Var => {
-                    self.declare_lexical(var_decl)?;
+                    self.declare_lexical(var_decl, None)?;
                 }
                 Stmt::Decl(Decl::Fn(fn_decl)) => {
                     self.declare_if_absent(fn_decl.ident.sym.to_string())?;
+                }
+                Stmt::Decl(Decl::Class(class_decl)) => {
+                    self.declare_variable(class_decl.ident.sym.to_string())?;
+                    self.mark_tdz(class_decl.class.span.hi);
                 }
                 _ => {}
             }
@@ -471,27 +891,144 @@ impl<'a> Compiler<'a> {
         Ok(())
     }
 
-    fn declare_lexical(&mut self, var_decl: &VarDecl) -> CompileResult {
-        for decl in &var_decl.decls {
-            if let Pat::Ident(ident) = &decl.name {
-                self.declare_variable(ident.id.sym.to_string())?;
+    /// Early errors for names declared twice in one block: a `let` / `const` / `class` may
+    /// share its name with nothing else there (including parameters and `var`s at a
+    /// function's top level), and block-level functions can't repeat either.
+    fn check_redeclarations(&self, stmts: &[&Stmt], function_top: bool) -> CompileResult {
+        let mut seen: Vec<(&str, bool)> = Vec::new(); // (name, lexical)
+        for stmt in stmts {
+            let names: Vec<(&Ident, bool)> = match stmt {
+                Stmt::Decl(Decl::Var(var_decl)) if var_decl.kind != VarDeclKind::Var => var_decl
+                    .decls
+                    .iter()
+                    .flat_map(|d| pat_idents(&d.name))
+                    .map(|i| (i, true))
+                    .collect(),
+                Stmt::Decl(Decl::Class(class_decl)) => vec![(&class_decl.ident, true)],
+                Stmt::Decl(Decl::Fn(fn_decl)) => vec![(&fn_decl.ident, false)],
+                _ => continue,
+            };
+            for (ident, lexical) in names {
+                let name = &*ident.sym;
+                let clash = seen.iter().any(|&(n, other_lexical)| {
+                    n == name && (lexical || other_lexical || !function_top)
+                }) || (lexical
+                    && self
+                        .locals
+                        .iter()
+                        .any(|l| l.name == name && l.depth == self.current_scope_depth));
+                if clash {
+                    return Err(CompileError::SyntaxError {
+                        what: format!("`{name}` has already been declared"),
+                        span: ident.span,
+                        location: String::new(),
+                    });
+                }
+                seen.push((name, lexical));
             }
         }
         Ok(())
     }
 
+    /// Declare a `let` / `const`'s names. `end` overrides where each is initialised
+    /// (a `for-in/of` head: after the iterated expression).
+    fn declare_lexical(&mut self, var_decl: &VarDecl, end: Option<BytePos>) -> CompileResult {
+        for decl in &var_decl.decls {
+            for ident in pat_idents(&decl.name) {
+                self.declare_variable(ident.sym.to_string())?;
+                if var_decl.kind == VarDeclKind::Const {
+                    self.locals.last_mut().unwrap().read_only = true;
+                }
+                self.mark_tdz(end.unwrap_or(decl.span.hi));
+            }
+        }
+        Ok(())
+    }
+
+    /// Give the local just declared a temporal dead zone ending at `decl_end`.
+    fn mark_tdz(&mut self, decl_end: BytePos) {
+        let always = self.in_switch;
+        let local = self.locals.last().unwrap();
+        // its `NewBox` (if captured) was the last instruction
+        let box_at = local.captured.then(|| self.bytecode.len() - 2);
+        let slot = local.slot;
+        if always {
+            // uninitialised from the start of the switch
+            match box_at {
+                Some(at) => self.bytecode[at] = Operation::NewBoxTdz(0).get_opcode(),
+                None => self.emit_op(Operation::Tdz(slot)),
+            }
+        }
+        self.locals.last_mut().unwrap().tdz = Some(Tdz {
+            decl_end,
+            always,
+            box_at,
+            needed: Cell::new(false),
+        });
+    }
+
+    /// Bindings that a closure checks start uninitialised: turn their `NewBox` into
+    /// `NewBoxTdz`. Done as each leaves scope (or at the end of the function).
+    fn patch_tdz(&mut self, from: usize) {
+        let opcode = Operation::NewBoxTdz(0).get_opcode();
+        for local in &self.locals[from..] {
+            if let Some(Tdz { box_at: Some(at), needed, always: false, .. }) = &local.tdz {
+                if needed.get() {
+                    self.bytecode[*at] = opcode;
+                }
+            }
+        }
+    }
+
+    /// How a use of `name` at `pos` deals with the temporal dead zone.
+    fn tdz_use(&self, name: &str, pos: BytePos) -> TdzUse {
+        let check = |tdz: &Tdz, at: BytePos, same_function: bool| {
+            if tdz.always {
+                TdzUse::Check
+            } else if at >= tdz.decl_end {
+                TdzUse::Free
+            } else if same_function {
+                TdzUse::Throw
+            } else {
+                tdz.needed.set(true);
+                TdzUse::Check
+            }
+        };
+        if let Some(local) = self.locals.iter().rev().find(|l| l.name == name) {
+            return local.tdz.as_ref().map_or(TdzUse::Free, |t| check(t, pos, true));
+        }
+        // a closure: what matters is where it (or the closure containing it) was made
+        let mut anchor = self.created_at;
+        let mut compiler = self.enclosing;
+        while let Some(c) = compiler {
+            if let Some(local) = c.locals.iter().rev().find(|l| l.name == name) {
+                return local.tdz.as_ref().map_or(TdzUse::Free, |t| check(t, anchor, false));
+            }
+            anchor = c.created_at;
+            compiler = c.enclosing;
+        }
+        TdzUse::Free
+    }
+
     fn compile_stmt(&mut self, stmt: &Stmt, is_last_in_module: bool) -> CompileResult {
         match stmt {
             Stmt::Expr(expr_stmt) => {
-                self.compile_expr(&expr_stmt.expr)?;
                 // leave the last statement's value on the stack so the test runner can read it
-                if !is_last_in_module {
-                    self.emit_op(Operation::Pop);
+                if is_last_in_module {
+                    self.compile_expr(&expr_stmt.expr)?;
+                } else {
+                    self.compile_discarded(&expr_stmt.expr)?;
                 }
             }
             Stmt::Return(return_stmt) => {
                 match &return_stmt.arg {
-                    Some(arg) => self.compile_expr(arg)?,
+                    Some(arg) => {
+                        self.compile_expr(arg)?;
+                        // an async generator's `return x` awaits x
+                        if self.coroutine == Coroutine::AsyncGenerator {
+                            self.emit_await();
+                        }
+                    }
                     None => self.emit_op(Operation::Undefined),
                 }
                 self.emit_unwind_tries(0)?;
@@ -499,6 +1036,12 @@ impl<'a> Compiler<'a> {
             }
             // compiled when hoisted by `hoist_declarations`
             Stmt::Decl(Decl::Fn(_)) => {}
+            Stmt::Decl(Decl::Class(class_decl)) => {
+                let ident = &class_decl.ident;
+                self.compile_class(Some(ident), &class_decl.class, Some(&ident.sym))?;
+                self.emit_init_var(ident)?;
+                self.emit_op(Operation::Pop);
+            }
             Stmt::Decl(Decl::Var(var_decl)) => self.compile_var_decl(var_decl)?,
             Stmt::Block(block_stmt) => self.compile_block(block_stmt)?,
             Stmt::Empty(_) | Stmt::Debugger(_) => {}
@@ -507,6 +1050,7 @@ impl<'a> Compiler<'a> {
             Stmt::DoWhile(do_while) => self.compile_do_while(do_while)?,
             Stmt::For(for_stmt) => self.compile_for(for_stmt)?,
             Stmt::ForIn(for_in) => self.compile_for_in(for_in)?,
+            Stmt::ForOf(for_of) => self.compile_for_of(for_of)?,
             Stmt::Labeled(labeled) => self.compile_labeled(labeled)?,
             Stmt::Break(break_stmt) => {
                 let label = break_stmt.label.as_ref().map(|l| &*l.sym);
@@ -518,7 +1062,9 @@ impl<'a> Compiler<'a> {
             Stmt::Continue(continue_stmt) => {
                 let label = continue_stmt.label.as_ref().map(|l| &*l.sym);
                 let target = self.find_breakable(label, true, continue_stmt.span)?;
-                self.emit_unwind_tries(self.breakables[target].try_depth)?;
+                // a `for-of` keeps its iterator open: its body region is left at the loop
+                let loop_ = &self.breakables[target];
+                self.emit_unwind_tries(loop_.try_depth + loop_.iter_region as usize)?;
                 let jump = self.emit_jump(Operation::Jump(0));
                 self.breakables[target].continues.push(jump);
             }
@@ -589,12 +1135,24 @@ impl<'a> Compiler<'a> {
     fn compile_for(&mut self, stmt: &ForStmt) -> CompileResult {
         // `let` in the initializer is scoped to the loop
         self.enter_scope();
+        // captured `let`/`const` loop variables get a fresh binding for each iteration
+        let mut per_iteration = Vec::new();
         match &stmt.init {
             Some(VarDeclOrExpr::VarDecl(var_decl)) => {
                 if var_decl.kind != VarDeclKind::Var {
-                    self.declare_lexical(var_decl)?;
+                    let first = self.locals.len();
+                    self.declare_lexical(var_decl, None)?;
+                    per_iteration = self.locals[first..]
+                        .iter()
+                        .filter(|l| l.captured)
+                        .map(|l| l.slot)
+                        .collect();
                 }
                 self.compile_var_decl(var_decl)?;
+                // closures made in the initializer keep the initial binding
+                for &slot in &per_iteration {
+                    self.emit_op(Operation::RenewBox(slot));
+                }
             }
             Some(VarDeclOrExpr::Expr(expr)) => {
                 self.compile_expr(expr)?;
@@ -616,9 +1174,12 @@ impl<'a> Compiler<'a> {
         };
         self.compile_stmt(&stmt.body, false)?;
         self.patch_continues();
+        // the next iteration starts with a copy, so closures from this one keep their value
+        for &slot in &per_iteration {
+            self.emit_op(Operation::RenewBox(slot));
+        }
         if let Some(update) = &stmt.update {
-            self.compile_expr(update)?;
-            self.emit_op(Operation::Pop);
+            self.compile_discarded(update)?;
         }
         self.emit_loop(start);
         if let Some(exit) = exit {
@@ -636,6 +1197,8 @@ impl<'a> Compiler<'a> {
         // keys array and index live in hidden slots, so break/continue leave nothing on the stack
         let keys = self.alloc_slot()?;
         let index = self.alloc_slot()?;
+        // the head's names exist (uninitialised) while the object expression runs
+        let target = self.loop_head_target(&stmt.left, &stmt.right)?;
         self.compile_expr(&stmt.right)?;
         self.emit_op(Operation::ForInKeys);
         self.emit_op(Operation::SetLocal(keys));
@@ -644,20 +1207,6 @@ impl<'a> Compiler<'a> {
         self.emit_op(Operation::SetLocal(index));
         self.emit_op(Operation::Pop);
 
-        // the loop variable
-        let target: &Pat = match &stmt.left {
-            ForHead::VarDecl(var_decl) => {
-                if var_decl.kind != VarDeclKind::Var {
-                    self.declare_lexical(var_decl)?;
-                }
-                match var_decl.decls.as_slice() {
-                    [decl] if decl.init.is_none() => &decl.name,
-                    _ => return unsupported("for-in declaration", var_decl.span),
-                }
-            }
-            ForHead::Pat(pat) => pat,
-            ForHead::UsingDecl(using) => return unsupported("using declaration", using.span),
-        };
 
         self.push_breakable(BreakableKind::Loop);
         let start = self.bytecode.len();
@@ -670,33 +1219,15 @@ impl<'a> Compiler<'a> {
         self.emit_op(Operation::Pop);
 
         // target = keys[index]
-        match target {
-            Pat::Ident(ident) => {
-                self.emit_op(Operation::GetLocal(keys));
-                self.emit_op(Operation::GetLocal(index));
-                self.emit_op(Operation::GetProperty);
-                self.emit_set_var(&ident.id)?;
-            }
-            Pat::Expr(expr) if matches!(&**expr, Expr::Member(_)) => {
-                let Expr::Member(member_expr) = &**expr else {
-                    unreachable!()
-                };
-                self.compile_expr(&member_expr.obj)?;
-                self.compile_member_prop(&member_expr.prop)?;
-                self.emit_op(Operation::GetLocal(keys));
-                self.emit_op(Operation::GetLocal(index));
-                self.emit_op(Operation::GetProperty);
-                self.emit_op(Operation::SetProperty);
-            }
-            pat => return unsupported("for-in target", pat.span()),
-        }
-        self.emit_op(Operation::Pop);
+        self.emit_op(Operation::GetLocal(keys));
+        self.emit_op(Operation::GetLocal(index));
+        self.emit_op(Operation::GetProperty);
+        self.bind_loop_head(&stmt.left, target)?;
 
         self.compile_stmt(&stmt.body, false)?;
         self.patch_continues();
         self.emit_op(Operation::GetLocal(index));
-        self.emit_op(Operation::LoadFloat64(1.0));
-        self.emit_op(Operation::Add);
+        self.emit_op(Operation::Increment);
         self.emit_op(Operation::SetLocal(index));
         self.emit_op(Operation::Pop);
         self.emit_loop(start);
@@ -707,6 +1238,110 @@ impl<'a> Compiler<'a> {
         Ok(())
     }
 
+    /// The pattern a `for-in` / `for-of` head assigns each value to, declaring its names.
+    fn loop_head_target<'h>(&mut self, head: &'h ForHead, right: &Expr) -> CompileResult<&'h Pat> {
+        match head {
+            ForHead::VarDecl(var_decl) => {
+                if var_decl.kind != VarDeclKind::Var {
+                    // the iterated expression still sees them uninitialised
+                    self.declare_lexical(var_decl, Some(right.span().hi))?;
+                }
+                match var_decl.decls.as_slice() {
+                    [decl] if decl.init.is_none() => Ok(&decl.name),
+                    _ => unsupported("for-in/of declaration", var_decl.span),
+                }
+            }
+            ForHead::Pat(pat) => Ok(pat),
+            ForHead::UsingDecl(using) => unsupported("using declaration", using.span),
+        }
+    }
+
+    /// Store the value on top of the stack into a loop head's target. A `let` / `const`
+    /// head gets fresh bindings each iteration.
+    fn bind_loop_head(&mut self, head: &ForHead, target: &Pat) -> CompileResult {
+        if matches!(head, ForHead::VarDecl(d) if d.kind != VarDeclKind::Var) {
+            for ident in pat_idents(target) {
+                if let Some(VarRef::Box(slot)) = self.resolve_local(&ident.sym) {
+                    self.emit_op(Operation::NewBox(slot));
+                }
+            }
+        }
+        self.compile_pattern(target, matches!(head, ForHead::VarDecl(_)))
+    }
+
+    /// `for (x of iterable)`. Each iteration's binding and body run in a protected region:
+    /// leaving it early (`break`, `return`, a throw) closes the iterator.
+    ///
+    ///   GetIterator -> it; L: IterNext(it, X) TryStart(H) bind body C: TryEnd Loop L;
+    ///   H: IterClose(it, throw) rethrow; X:
+    fn compile_for_of(&mut self, stmt: &ForOfStmt) -> CompileResult {
+        let is_await = stmt.is_await;
+        if is_await && !self.coroutine.is_async() {
+            return unsupported("top-level for await", stmt.span);
+        }
+        self.enter_scope();
+        // the iterator lives in a hidden slot, so break/continue leave nothing on the stack
+        let iterator = self.alloc_slot()?;
+        // the iterable is evaluated with the head's names declared (but not initialised)
+        let target = self.loop_head_target(&stmt.left, &stmt.right)?;
+        self.compile_expr(&stmt.right)?;
+        self.emit_op(if is_await {
+            Operation::GetAsyncIterator
+        } else {
+            Operation::GetIterator
+        });
+        self.emit_op(Operation::SetLocal(iterator));
+        self.emit_op(Operation::Pop);
+
+        self.push_breakable(BreakableKind::Loop);
+        self.breakables.last_mut().unwrap().iter_region = true;
+        let start = self.bytecode.len();
+        let exit = if is_await {
+            // await the next result, then take its value
+            self.emit_op(Operation::AsyncIterNext(iterator));
+            self.emit_await();
+            self.emit_jump(Operation::IterResult(iterator, 0))
+        } else {
+            self.emit_jump(Operation::IterNext(iterator, 0))
+        };
+        let handler = self.emit_jump(Operation::TryStart(0));
+        self.push_try_region(None);
+        self.try_stack.last_mut().unwrap().close_iterator = Some((iterator, is_await));
+        self.bind_loop_head(&stmt.left, target)?;
+        self.compile_stmt(&stmt.body, false)?;
+        self.patch_continues();
+        self.try_stack.pop();
+        self.emit_op(Operation::TryEnd);
+        self.emit_loop(start);
+
+        // thrown from the binding or body: close the iterator (ignoring its errors), rethrow
+        self.patch_jump(handler);
+        let temp = self.temp()?;
+        self.emit_op(Operation::SetLocal(temp));
+        self.emit_op(Operation::Pop);
+        self.emit_iter_close(iterator, is_await, 1);
+        self.emit_op(Operation::GetLocal(temp));
+        self.emit_op(Operation::Throw);
+
+        self.patch_jump(exit);
+        self.pop_breakable();
+        self.exit_scope();
+        Ok(())
+    }
+
+    /// Close the iterator record in a slot; mode 1 (leaving by a throw) ignores errors.
+    /// An async iterator's `return()` result is awaited.
+    fn emit_iter_close(&mut self, iterator: u8, is_async: bool, mode: u8) {
+        if !is_async {
+            self.emit_op(Operation::IterClose(iterator, mode));
+            return;
+        }
+        let skip = self.emit_jump(Operation::AsyncIterClose(iterator, mode, 0));
+        self.emit_await();
+        self.emit_op(Operation::IterCloseCheck(mode));
+        self.patch_jump(skip);
+    }
+
     fn compile_labeled(&mut self, stmt: &LabeledStmt) -> CompileResult {
         self.pending_labels.push(stmt.label.sym.to_string());
         match &*stmt.body {
@@ -715,6 +1350,7 @@ impl<'a> Compiler<'a> {
             | Stmt::DoWhile(_)
             | Stmt::For(_)
             | Stmt::ForIn(_)
+            | Stmt::ForOf(_)
             | Stmt::Switch(_)
             | Stmt::Labeled(_) => self.compile_stmt(&stmt.body, false),
             body => {
@@ -735,7 +1371,10 @@ impl<'a> Compiler<'a> {
         self.emit_op(Operation::Pop);
 
         let all_stmts: Vec<&Stmt> = stmt.cases.iter().flat_map(|c| c.cons.iter()).collect();
-        self.hoist_declarations(&all_stmts, false)?;
+        self.in_switch = true;
+        let hoisted = self.hoist_declarations(&all_stmts, false);
+        self.in_switch = false;
+        hoisted?;
 
         self.push_breakable(BreakableKind::Switch);
 
@@ -774,7 +1413,11 @@ impl<'a> Compiler<'a> {
             }
         }
         if !has_default {
-            self.breakables.last_mut().unwrap().breaks.push(default_jump);
+            self.breakables
+                .last_mut()
+                .unwrap()
+                .breaks
+                .push(default_jump);
         }
 
         self.pop_breakable();
@@ -804,14 +1447,14 @@ impl<'a> Compiler<'a> {
                 // the thrown value is on the stack
                 self.enter_scope();
                 match &catch.param {
-                    Some(Pat::Ident(ident)) => {
-                        let slot = self.declare_variable(ident.id.sym.to_string())?;
-                        self.emit_op(Operation::SetLocal(slot));
+                    Some(pat) => {
+                        for ident in pat_idents(pat) {
+                            self.declare_variable(ident.sym.to_string())?;
+                        }
+                        self.compile_pattern(pat, true)?;
                     }
-                    Some(pat) => return unsupported("catch parameter pattern", pat.span()),
-                    None => {}
+                    None => self.emit_op(Operation::Pop),
                 }
-                self.emit_op(Operation::Pop);
 
                 if finally.is_some() {
                     finally_handler = Some(self.emit_jump(Operation::TryStart(0)));
@@ -855,6 +1498,7 @@ impl<'a> Compiler<'a> {
     fn push_try_region(&mut self, finally: Option<&BlockStmt>) {
         self.try_stack.push(TryRegion {
             finally: finally.cloned(),
+            close_iterator: None,
             locals_len: self.locals.len(),
             scope_depth: self.current_scope_depth,
         });
@@ -867,6 +1511,9 @@ impl<'a> Compiler<'a> {
         while i > depth {
             i -= 1;
             self.emit_op(Operation::TryEnd);
+            if let Some((iterator, is_async)) = self.try_stack[i].close_iterator {
+                self.emit_iter_close(iterator, is_async, 0);
+            }
             let Some(finally) = self.try_stack[i].finally.clone() else {
                 continue;
             };
@@ -904,6 +1551,7 @@ impl<'a> Compiler<'a> {
             breaks: Vec::new(),
             continues: Vec::new(),
             try_depth: self.try_stack.len(),
+            iter_region: false,
         });
     }
 
@@ -921,7 +1569,12 @@ impl<'a> Compiler<'a> {
         }
     }
 
-    fn find_breakable(&self, label: Option<&str>, is_continue: bool, span: Span) -> CompileResult<usize> {
+    fn find_breakable(
+        &self,
+        label: Option<&str>,
+        is_continue: bool,
+        span: Span,
+    ) -> CompileResult<usize> {
         let found = self.breakables.iter().rposition(|b| match label {
             Some(label) => b.labels.iter().any(|l| l == label),
             None if is_continue => b.kind == BreakableKind::Loop,
@@ -948,6 +1601,12 @@ impl<'a> Compiler<'a> {
     /// Leave a block: its names go out of scope (their slots are not reused).
     fn exit_scope(&mut self) {
         self.current_scope_depth -= 1;
+        let keep = self
+            .locals
+            .iter()
+            .rposition(|l| l.depth <= self.current_scope_depth)
+            .map_or(0, |i| i + 1);
+        self.patch_tdz(keep);
         while self
             .locals
             .last()
@@ -979,15 +1638,57 @@ impl<'a> Compiler<'a> {
         }
     }
 
-    /// Declare a name in the current block and return its new slot.
+    /// Declare a name in the current block and return its new slot. Emitted where the
+    /// scope starts: a captured name gets a fresh box each time this point runs.
     fn declare_variable(&mut self, name: String) -> CompileResult<u8> {
         let slot = self.alloc_slot()?;
+        if self.add_local(name, slot) {
+            self.emit_op(Operation::NewBox(slot));
+        }
+        Ok(slot)
+    }
+
+    /// Add a name in the current block; returns whether it's captured (boxed).
+    fn add_local(&mut self, name: String, slot: u8) -> bool {
+        let captured = self.captured_names.contains(&name);
         self.locals.push(Local {
             name,
             depth: self.current_scope_depth,
             slot,
+            captured,
+            read_only: false,
+            private: None,
+            tdz: None,
         });
-        Ok(slot)
+        captured
+    }
+
+    fn local_by_slot(&self, slot: u8) -> &Local {
+        self.locals
+            .iter()
+            .rev()
+            .find(|l| l.slot == slot)
+            .expect("slot belongs to a declared local")
+    }
+
+    /// Push a declared local's value.
+    fn emit_load_slot(&mut self, slot: u8) {
+        let op = if self.local_by_slot(slot).captured {
+            Operation::GetBox(slot)
+        } else {
+            Operation::GetLocal(slot)
+        };
+        self.emit_op(op);
+    }
+
+    /// Store the top of the stack into a declared local's slot, leaving it on the stack.
+    fn emit_store_slot(&mut self, slot: u8) {
+        let op = if self.local_by_slot(slot).captured {
+            Operation::SetBox(slot)
+        } else {
+            Operation::SetLocal(slot)
+        };
+        self.emit_op(op);
     }
 
     /// Declare a name unless the current block already has it (`var` redeclaring a param, etc).
@@ -1004,45 +1705,119 @@ impl<'a> Compiler<'a> {
         }
     }
 
-    fn resolve_local(&self, name: &str) -> Option<(u8, u8)> {
+    fn resolve_local(&self, name: &str) -> Option<VarRef> {
         if let Some(local) = self.locals.iter().rev().find(|l| l.name == name) {
-            return Some((0, local.slot));
+            return Some(if local.captured {
+                VarRef::Box(local.slot)
+            } else {
+                VarRef::Local(local.slot)
+            });
         }
+        self.resolve_upvalue(name).map(VarRef::Upvalue)
+    }
+
+    /// Find `name` in an enclosing function and return this function's capture index for it,
+    /// adding captures along the way (clox-style).
+    fn resolve_upvalue(&self, name: &str) -> Option<u8> {
         let enclosing = self.enclosing?;
-        let (depth, slot) = enclosing.resolve_local(name)?;
-        Some((depth + 1, slot))
+        let capture = match enclosing.locals.iter().rev().find(|l| l.name == name) {
+            Some(local) => {
+                debug_assert!(local.captured, "`{name}` is used by a nested function");
+                (true, local.slot)
+            }
+            None => (false, enclosing.resolve_upvalue(name)?),
+        };
+        let mut upvalues = self.upvalues.borrow_mut();
+        if let Some(index) = upvalues.iter().position(|u| *u == capture) {
+            return Some(index as u8);
+        }
+        upvalues.push(capture);
+        Some((upvalues.len() - 1) as u8)
     }
 
     /// Push the value of a variable. Undeclared names are an error, except the host's
     /// `window` / `globalThis`.
     fn emit_get_var(&mut self, ident: &Ident) -> CompileResult {
         let name = &*ident.sym;
+        let tdz = self.tdz_use(name, ident.span.lo);
+        if tdz == TdzUse::Throw {
+            self.emit_op(Operation::ThrowTdz);
+            return Ok(());
+        }
         match self.resolve_local(name) {
-            Some((0, slot)) => self.emit_op(Operation::GetLocal(slot)),
-            Some((depth, slot)) => self.emit_op(Operation::GetUpvalue(depth, slot)),
+            Some(VarRef::Local(slot)) => self.emit_op(Operation::GetLocal(slot)),
+            Some(VarRef::Box(slot)) => self.emit_op(Operation::GetBox(slot)),
+            Some(VarRef::Upvalue(index)) => self.emit_op(Operation::GetUpvalue(index)),
             None => match (HostGlobal::from_name(name), name) {
                 (Some(host), _) => self.emit_op(Operation::HostGlobal(host as u8)),
                 // read-only global constants compile to plain values
                 (None, "undefined") => self.emit_op(Operation::Undefined),
                 (None, "NaN") => self.emit_op(Operation::LoadFloat64(f64::NAN)),
                 (None, "Infinity") => self.emit_op(Operation::LoadFloat64(f64::INFINITY)),
-                (None, "arguments") if self.enclosing.is_some() => {
-                    self.emit_op(Operation::Arguments)
-                }
+                (None, "arguments") if self.has_arguments() => self.emit_op(Operation::Arguments),
                 (None, _) => {
                     return unsupported(format!("undeclared variable `{name}`"), ident.span)
                 }
             },
         }
+        if tdz == TdzUse::Check {
+            self.emit_op(Operation::CheckTdz);
+        }
         Ok(())
     }
 
+    /// Whether `arguments` exists here: inside a non-arrow function, or an arrow within one.
+    fn has_arguments(&self) -> bool {
+        match self.enclosing {
+            None => false,
+            Some(enclosing) => !self.is_arrow || enclosing.has_arguments(),
+        }
+    }
+
+    /// Whether `name` resolves to a read-only binding (`const`, a function expression's name).
+    fn is_read_only(&self, name: &str) -> bool {
+        match self.locals.iter().rev().find(|l| l.name == name) {
+            Some(local) => local.read_only,
+            None => self.enclosing.is_some_and(|e| e.is_read_only(name)),
+        }
+    }
+
     /// Store the top of the stack into a declared variable, leaving it on the stack.
+    /// Assigning to a `const` throws a `TypeError` when it runs (after the value is computed).
     fn emit_set_var(&mut self, ident: &Ident) -> CompileResult {
+        // writing before the declaration throws too (after the value is computed)
+        match self.tdz_use(&ident.sym, ident.span.lo) {
+            TdzUse::Throw => {
+                self.emit_op(Operation::ThrowTdz);
+                return Ok(());
+            }
+            TdzUse::Check => {
+                self.emit_get_var(ident)?;
+                self.emit_op(Operation::Pop);
+            }
+            TdzUse::Free => {}
+        }
+        if self.is_read_only(&ident.sym) {
+            self.emit_op(Operation::Pop);
+            self.emit_op(Operation::HostGlobal(HostGlobal::GlobalThis as u8));
+            self.emit_op(load_str("TypeError"));
+            self.emit_op(Operation::GetProperty);
+            self.emit_op(load_str("Assignment to constant variable."));
+            self.emit_op(Operation::UInt64(1));
+            self.emit_op(Operation::New);
+            self.emit_op(Operation::Throw);
+            return Ok(());
+        }
+        self.emit_init_var(ident)
+    }
+
+    /// Like `emit_set_var`, but also for initialising a `const` in its declaration.
+    fn emit_init_var(&mut self, ident: &Ident) -> CompileResult {
         let name = &*ident.sym;
         match self.resolve_local(name) {
-            Some((0, slot)) => self.emit_op(Operation::SetLocal(slot)),
-            Some((depth, slot)) => self.emit_op(Operation::SetUpvalue(depth, slot)),
+            Some(VarRef::Local(slot)) => self.emit_op(Operation::SetLocal(slot)),
+            Some(VarRef::Box(slot)) => self.emit_op(Operation::SetBox(slot)),
+            Some(VarRef::Upvalue(index)) => self.emit_op(Operation::SetUpvalue(index)),
             None if HostGlobal::from_name(name).is_some() => {
                 return unsupported(format!("assignment to `{name}`"), ident.span)
             }
@@ -1069,18 +1844,14 @@ impl<'a> Compiler<'a> {
         kind: VarDeclKind,
         var_declarator: &VarDeclarator,
     ) -> CompileResult {
-        let Pat::Ident(name) = &var_declarator.name else {
-            return unsupported("destructuring declaration", var_declarator.name.span());
-        };
-        match var_declarator.init {
-            Some(ref init) => self.compile_expr(init)?,
+        match (&var_declarator.init, &var_declarator.name) {
+            (Some(init), Pat::Ident(ident)) => self.compile_expr_named(init, &ident.id.sym)?,
+            (Some(init), _) => self.compile_expr(init)?,
             // `var x;` leaves an existing value alone
-            None if kind == VarDeclKind::Var => return Ok(()),
-            None => self.emit_op(Operation::Undefined),
+            (None, _) if kind == VarDeclKind::Var => return Ok(()),
+            (None, _) => self.emit_op(Operation::Undefined),
         }
-        self.emit_set_var(&name.id)?;
-        self.emit_op(Operation::Pop);
-        Ok(())
+        self.compile_pattern(&var_declarator.name, true)
     }
 
     // ---------------------------------------------------------------------------------
@@ -1088,7 +1859,10 @@ impl<'a> Compiler<'a> {
     // ---------------------------------------------------------------------------------
 
     fn compile_fn_decl(&mut self, fn_decl: &FnDecl, internal: bool) -> CompileResult {
-        self.compile_function(Some(&fn_decl.ident), &fn_decl.function, false, internal)?;
+        self.hoisting_fn = true;
+        let compiled = self.compile_function(Some(&fn_decl.ident), &fn_decl.function, false, internal);
+        self.hoisting_fn = false;
+        compiled?;
         self.emit_set_var(&fn_decl.ident)?;
         self.emit_op(Operation::Pop);
         Ok(())
@@ -1103,52 +1877,228 @@ impl<'a> Compiler<'a> {
         self_binding: bool,
         internal: bool,
     ) -> CompileResult {
-        let mut fn_compiler = Compiler::new_enclosing(self);
+        let self_name = name.filter(|_| self_binding);
+        let name = name.map(|n| &*n.sym);
+        self.compile_fn_value(name, self_name, function, internal, FnKind::Normal)
+    }
 
-        // parameters are the first slots; the VM fills them from the call's arguments
-        for param in &function.params {
-            match &param.pat {
-                Pat::Ident(ident) => {
-                    fn_compiler.declare_variable(ident.id.sym.to_string())?;
+    /// Push a function made from a `Function` node (declarations, expressions, methods).
+    fn compile_fn_value(
+        &mut self,
+        name: Option<&str>,
+        self_name: Option<&Ident>,
+        function: &Function,
+        internal: bool,
+        kind: FnKind,
+    ) -> CompileResult {
+        let params: Vec<&Pat> = function.params.iter().map(|p| &p.pat).collect();
+        let body = match &function.body {
+            Some(body) => FnBody::Block(&body.stmts),
+            None => FnBody::Block(&[]),
+        };
+        let coroutine = Coroutine::of(function.is_generator, function.is_async);
+        // a function value exists from here (declarations are hoisted: they set no anchor)
+        if !self.hoisting_fn {
+            self.next_anchor = Some(function.span.lo);
+        }
+        self.compile_closure(name, self_name, &params, &body, internal, kind, coroutine)
+    }
+
+    fn compile_arrow(
+        &mut self,
+        arrow: &ArrowExpr,
+        name: Option<&str>,
+        internal: bool,
+    ) -> CompileResult {
+        let params: Vec<&Pat> = arrow.params.iter().collect();
+        let body = match &*arrow.body {
+            ArrowFunctionBody::FunctionBody(block) => FnBody::Block(&block.stmts),
+            ArrowFunctionBody::Expr(expr) => FnBody::Expr(expr),
+        };
+        let coroutine = Coroutine::of(arrow.is_generator, arrow.is_async);
+        self.next_anchor = Some(arrow.span.lo);
+        self.compile_closure(name, None, &params, &body, internal, FnKind::Arrow, coroutine)
+    }
+
+    /// Compile a function body in its own compiler and push the closure.
+    fn compile_closure(
+        &mut self,
+        name: Option<&str>,
+        self_name: Option<&Ident>,
+        params: &[&Pat],
+        body: &FnBody,
+        internal: bool,
+        kind: FnKind,
+        coroutine: Coroutine,
+    ) -> CompileResult {
+        let created_at = self
+            .next_anchor
+            .take()
+            .or(self.class_anchor)
+            .unwrap_or(BytePos(0));
+        let mut c = Compiler::new_enclosing(self);
+        c.is_arrow = kind == FnKind::Arrow;
+        c.coroutine = coroutine;
+        c.created_at = created_at;
+        let body_stmts: Vec<&Stmt> = match body {
+            FnBody::Block(stmts) => stmts.iter().collect(),
+            _ => Vec::new(),
+        };
+        c.captured_names = captured_names(params, body, &body_stmts);
+        // a base class constructor first sets up the instance's private methods and fields
+        // (before its parameters); a derived one does it when `super(...)` returns
+        if kind == FnKind::BaseClass {
+            c.emit_op(Operation::InitInstance);
+            c.emit_op(Operation::Pop);
+        }
+
+        // parameters are the first slots; the VM fills them from the call's arguments. A
+        // pattern parameter gets a hidden slot that is destructured once all names exist.
+        let mut length = None;
+        let mut inits = Vec::new();
+        let mut rest = None;
+        for (i, pat) in params.iter().enumerate() {
+            let (target, default) = match pat {
+                Pat::Assign(assign) => (&*assign.left, Some(&*assign.right)),
+                Pat::Rest(rest_pat) => {
+                    rest = Some((&*rest_pat.arg, i as u8));
+                    length.get_or_insert(i);
+                    break; // the parser only allows it last
                 }
-                pat => return unsupported("parameter pattern", pat.span()),
+                pat => (*pat, None),
+            };
+            if default.is_some() {
+                length.get_or_insert(i);
+            }
+            let slot = c.alloc_slot()?;
+            match target {
+                Pat::Ident(ident) => {
+                    if c.add_local(ident.id.sym.to_string(), slot) {
+                        c.emit_op(Operation::BoxLocal(slot));
+                    }
+                    if let Some(default) = default {
+                        inits.push((slot, Some(default), None, Some(&*ident.id.sym)));
+                    }
+                }
+                pat => inits.push((slot, default, Some(pat), None)),
             }
         }
+        let param_count = c.slot_count as u8;
+        // names bound by patterns (and the rest parameter)
+        let pattern_params = inits.iter().filter_map(|(_, _, pat, _)| *pat);
+        for pat in pattern_params.chain(rest.map(|(pat, _)| pat)) {
+            for ident in pat_idents(pat) {
+                c.declare_variable(ident.sym.to_string())?;
+            }
+        }
+        // defaults and patterns run in parameter order; a default is used when its
+        // argument is missing or `undefined`
+        for (slot, default, pat, name) in inits {
+            match pat {
+                None => c.emit_load_slot(slot),
+                Some(_) => c.emit_op(Operation::GetLocal(slot)),
+            }
+            if let Some(default) = default {
+                c.emit_default(default, name)?;
+            }
+            match pat {
+                None => {
+                    c.emit_store_slot(slot);
+                    c.emit_op(Operation::Pop);
+                }
+                Some(pat) => c.compile_pattern(pat, true)?,
+            }
+        }
+        if let Some((pat, start)) = rest {
+            c.emit_op(Operation::RestArgs(start));
+            c.compile_pattern(pat, true)?;
+        }
 
-        if let (true, Some(name)) = (self_binding, name) {
+        if let Some(name) = self_name {
             // a parameter with the same name wins
-            if !fn_compiler.locals.iter().any(|l| l.name == *name.sym) {
-                let slot = fn_compiler.declare_variable(name.sym.to_string())?;
-                fn_compiler.emit_op(Operation::Callee);
-                fn_compiler.emit_op(Operation::SetLocal(slot));
-                fn_compiler.emit_op(Operation::Pop);
+            if !c.locals.iter().any(|l| l.name == *name.sym) {
+                let slot = c.declare_variable(name.sym.to_string())?;
+                c.locals.last_mut().unwrap().read_only = true;
+                c.emit_op(Operation::Callee);
+                c.emit_store_slot(slot);
+                c.emit_op(Operation::Pop);
             }
         }
 
-        if let Some(body) = &function.body {
-            let stmts: Vec<&Stmt> = body.stmts.iter().collect();
-            fn_compiler.compile_body(&stmts, true, false)?;
+        // a generator stops here (parameters are set up when it's called) and hands back
+        // its generator object; the first `next()` resumes it (its value is unused)
+        if coroutine.is_generator() {
+            c.emit_op(Operation::InitialYield);
+            c.emit_op(Operation::Pop);
         }
 
-        // implicit `return undefined`
-        fn_compiler.emit_op(Operation::Undefined);
-        fn_compiler.emit_op(Operation::Return);
+        match body {
+            FnBody::Block(_) => {
+                c.compile_body(&body_stmts, true, false)?;
+                // implicit `return undefined`
+                c.emit_op(Operation::Undefined);
+            }
+            FnBody::Expr(expr) => {
+                c.compile_expr(expr)?;
+                if coroutine == Coroutine::AsyncGenerator {
+                    c.emit_await();
+                }
+            }
+            FnBody::Field(expr, Some(name)) => c.compile_expr_named(expr, name)?,
+            FnBody::Field(expr, None) => c.compile_expr(expr)?,
+            FnBody::DefaultDerived => {
+                c.emit_op(Operation::RestArgs(0));
+                c.emit_op(Operation::SpreadArgs);
+                c.emit_op(Operation::SuperCall);
+                c.emit_op(Operation::SuperCallFinish);
+                c.emit_op(Operation::Pop);
+                c.emit_op(Operation::Undefined);
+            }
+            FnBody::InstanceFields(fields) => {
+                for (i, field) in fields.iter().enumerate() {
+                    match (field.value, &field.name) {
+                        (Some(value), Some(name)) => c.compile_expr_named(value, name)?,
+                        (Some(value), None) => c.compile_expr(value)?,
+                        (None, _) => c.emit_op(Operation::Undefined),
+                    }
+                    let name_it = field.name.is_none() && field.value.is_some_and(is_anonymous_fn);
+                    c.emit_op(Operation::InitField(i as u32, name_it as u8));
+                }
+                // the instance is what `super(...)` / the constructor's set-up gives back
+                c.emit_op(Operation::This);
+            }
+        }
+        c.emit_op(Operation::Return);
+        c.patch_tdz(0);
 
-        let code = fn_compiler.bytecode;
-        let arity = function.params.len() as u8;
+        let captures = c.upvalues.into_inner();
         // an internal function's name and length can't be observed, so leave the name out
         let name = match name {
-            Some(n) if !internal => n.sym.to_string(),
+            Some(n) if !internal => n.to_string(),
             _ => String::new(),
         };
-        self.emit_op(Operation::Function(arity, name, code, internal));
+        self.emit_op(Operation::Function(FnInfo {
+            length: length.unwrap_or(params.len()) as u8,
+            params: param_count,
+            kind,
+            coroutine,
+            internal,
+            name,
+            captures,
+            code: c.bytecode,
+        }));
         Ok(())
     }
 
     fn compile_call(&mut self, expr: &CallExpr) -> CompileResult {
         let callee = match &expr.callee {
             Callee::Expr(callee_expr) => callee_expr,
-            Callee::Super(s) => return unsupported("super call", s.span),
+            Callee::Super(_) => {
+                self.compile_args(&expr.args)?;
+                self.emit_op(Operation::SuperCall);
+                self.emit_op(Operation::SuperCallFinish);
+                return Ok(());
+            }
             Callee::Import(i) => return unsupported("dynamic import", i.span),
         };
 
@@ -1165,12 +2115,42 @@ impl<'a> Compiler<'a> {
             };
             self.compile_function(fn_expr.ident.as_ref(), &fn_expr.function, true, internal)?;
             false
+        } else if let Expr::Arrow(arrow) = unwrapped {
+            // `(() => {...})()` can't refer to itself, so it never escapes
+            self.compile_arrow(arrow, None, true)?;
+            false
+        } else if let Expr::SuperProp(super_prop) = unwrapped {
+            // `super.m()` calls the parent's m with this `this`: [this, m]
+            self.emit_op(Operation::This);
+            self.compile_super_prop(&super_prop.prop)?;
+            self.emit_op(Operation::SuperGet);
+            true
+        } else if let Expr::OptChain(chain @ OptChainExpr { base, .. }) = unwrapped {
+            // `(a?.b)()` keeps `this`: [obj, f], or [undefined, undefined] if short-circuited
+            if !matches!(&**base, OptChainBase::Member(_)) {
+                self.compile_expr(unwrapped)?;
+                false
+            } else {
+                let mut nullish = Vec::new();
+                self.compile_chain(chain, &mut nullish, true)?;
+                if !nullish.is_empty() {
+                    let end = self.emit_jump(Operation::Jump(0));
+                    for jump in nullish {
+                        self.patch_jump(jump);
+                    }
+                    self.emit_op(Operation::Pop);
+                    self.emit_op(Operation::Undefined);
+                    self.emit_op(Operation::Undefined);
+                    self.patch_jump(end);
+                }
+                true
+            }
         } else if let Expr::Member(member_expr) = unwrapped {
             // stack: [obj, f]
             self.compile_expr(&member_expr.obj)?;
             self.emit_op(Operation::Dup);
-            self.compile_member_prop(&member_expr.prop)?;
-            self.emit_op(Operation::GetProperty);
+            let access = self.compile_member_prop(&member_expr.prop)?;
+            self.emit_member_get(access);
             true
         } else {
             self.compile_expr(callee)?;
@@ -1187,14 +2167,42 @@ impl<'a> Compiler<'a> {
     }
 
     /// Push each argument, then the argument count.
-    fn compile_args(&mut self, args: &[swc_ecma_ast::ExprOrSpread]) -> CompileResult {
+    fn compile_args(&mut self, args: &[ExprOrSpread]) -> CompileResult {
+        if args.iter().any(|a| a.spread.is_some()) {
+            let elems: Vec<Option<ExprOrSpread>> = args.iter().cloned().map(Some).collect();
+            self.compile_spread_array(&elems)?;
+            self.emit_op(Operation::SpreadArgs);
+            return Ok(());
+        }
         for arg in args {
-            if let Some(spread) = arg.spread {
-                return unsupported("spread argument", spread);
-            }
             self.compile_expr(&arg.expr)?;
         }
         self.emit_op(Operation::UInt64(args.len() as u64));
+        Ok(())
+    }
+
+    /// Build an array element by element, for literals and argument lists containing `...x`.
+    fn compile_spread_array(&mut self, elems: &[Option<ExprOrSpread>]) -> CompileResult {
+        self.emit_op(Operation::Array(0));
+        for elem in elems {
+            match elem {
+                Some(ExprOrSpread {
+                    spread: Some(_),
+                    expr,
+                }) => {
+                    self.compile_expr(expr)?;
+                    self.emit_op(Operation::ArraySpread);
+                }
+                Some(ExprOrSpread { spread: None, expr }) => {
+                    self.compile_expr(expr)?;
+                    self.emit_op(Operation::ArrayAppend);
+                }
+                None => {
+                    self.emit_op(Operation::Hole);
+                    self.emit_op(Operation::ArrayAppend);
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1209,20 +2217,78 @@ impl<'a> Compiler<'a> {
     // expressions
     // ---------------------------------------------------------------------------------
 
-    /// Push the property key of a member expression.
-    fn compile_member_prop(&mut self, prop: &MemberProp) -> CompileResult {
+    /// Push the property key of a member expression (or its private name), and return
+    /// how to read / write it.
+    fn compile_member_prop(&mut self, prop: &MemberProp) -> CompileResult<Access> {
         match prop {
             MemberProp::Ident(ident) => self.emit_op(load_str(&ident.sym)),
             MemberProp::Computed(computed) => self.compile_expr(&computed.expr)?,
-            MemberProp::PrivateName(p) => return unsupported("private name", p.span),
+            MemberProp::PrivateName(name) => {
+                return Ok(Access::Private(self.emit_private_name(name)?))
+            }
         }
-        Ok(())
+        Ok(Access::Property)
+    }
+
+    /// A computed key that's both read and written (`o[k] += 1`, `o[k]++`) is converted to
+    /// a property key once, so `k`'s `toString` runs once.
+    fn emit_key_once(&mut self, prop: &MemberProp) {
+        if let MemberProp::Computed(computed) = prop {
+            if !matches!(&*computed.expr, Expr::Lit(_)) {
+                self.emit_op(Operation::ToPropertyKey);
+            }
+        }
+    }
+
+    /// [obj, key] -> [value]
+    fn emit_member_get(&mut self, access: Access) {
+        self.emit_op(match access {
+            Access::Property => Operation::GetProperty,
+            Access::Private(_) => Operation::PrivateGet,
+        });
+    }
+
+    /// [obj, key, value] -> [value]
+    fn emit_member_set(&mut self, access: Access) {
+        match access {
+            Access::Property => self.emit_op(Operation::SetProperty),
+            Access::Private(kind) => {
+                self.emit_op(Operation::PrivateSet);
+                if kind == PrivateKind::Accessor {
+                    // drop the setter's return value
+                    self.emit_op(Operation::Pop);
+                }
+            }
+        }
+    }
+
+    /// Push the private name object `#x` refers to (from the enclosing class bodies).
+    fn emit_private_name(&mut self, name: &PrivateName) -> CompileResult<PrivateKind> {
+        let key = private_key(name);
+        let Some(kind) = self.private_kind(&key) else {
+            return unsupported(format!("undeclared private name `{key}`"), name.span);
+        };
+        match self.resolve_local(&key) {
+            Some(VarRef::Local(slot)) => self.emit_op(Operation::GetLocal(slot)),
+            Some(VarRef::Box(slot)) => self.emit_op(Operation::GetBox(slot)),
+            Some(VarRef::Upvalue(index)) => self.emit_op(Operation::GetUpvalue(index)),
+            None => unreachable!("a private name with a kind has a slot"),
+        }
+        Ok(kind)
+    }
+
+    /// The kind of the innermost private name called `key` (`#x`) in scope.
+    fn private_kind(&self, key: &str) -> Option<PrivateKind> {
+        match self.locals.iter().rev().find(|l| l.name == key) {
+            Some(local) => local.private,
+            None => self.enclosing?.private_kind(key),
+        }
     }
 
     fn compile_member_expr(&mut self, member_expr: &MemberExpr) -> CompileResult {
         self.compile_expr(&member_expr.obj)?;
-        self.compile_member_prop(&member_expr.prop)?;
-        self.emit_op(Operation::GetProperty);
+        let access = self.compile_member_prop(&member_expr.prop)?;
+        self.emit_member_get(access);
         Ok(())
     }
 
@@ -1254,8 +2320,269 @@ impl<'a> Compiler<'a> {
             Expr::Fn(fn_expr) => {
                 self.compile_function(fn_expr.ident.as_ref(), &fn_expr.function, true, false)?
             }
+            Expr::Arrow(arrow) => self.compile_arrow(arrow, None, false)?,
+            Expr::Tpl(tpl) => self.compile_tpl(tpl)?,
+            Expr::Class(class_expr) => {
+                let name = class_expr.ident.as_ref().map(|i| &*i.sym);
+                self.compile_class(class_expr.ident.as_ref(), &class_expr.class, name)?
+            }
+            Expr::SuperProp(super_prop) => {
+                self.compile_super_prop(&super_prop.prop)?;
+                self.emit_op(Operation::SuperGet);
+            }
+            Expr::MetaProp(meta) if meta.kind == MetaPropKind::NewTarget => {
+                self.emit_op(Operation::NewTarget)
+            }
+            Expr::TaggedTpl(tagged) => self.compile_tagged_tpl(tagged)?,
+            Expr::Yield(yield_expr) => self.compile_yield(yield_expr)?,
+            Expr::Await(await_expr) => {
+                if !self.coroutine.is_async() {
+                    return unsupported("top-level await", await_expr.span);
+                }
+                self.compile_expr(&await_expr.arg)?;
+                self.emit_await();
+            }
+            Expr::OptChain(chain) => {
+                let mut nullish = Vec::new();
+                self.compile_chain(chain, &mut nullish, false)?;
+                self.end_chain(nullish, Operation::Undefined);
+            }
             _ => return unsupported(expr_kind(expr), expr.span()),
         }
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------------------------
+    // generators and async functions
+    // ---------------------------------------------------------------------------------
+
+    /// [value] -> [result]: suspend until the awaited value settles. A rejection resumes
+    /// at the `Throw` right after, a fulfilment just after it.
+    fn emit_await(&mut self) {
+        self.emit_op(Operation::Await);
+        self.emit_op(Operation::Throw);
+    }
+
+    /// Emit `Yield` for the value on top of the stack. `raw` yields it as the iterator
+    /// result itself (`yield*` passing on its inner results). Resuming continues after it
+    /// with the value sent in by `next(v)`; `throw(e)` throws e here and `return(v)`
+    /// returns v from here (running `finally` blocks and closing `for-of` iterators).
+    fn emit_yield(&mut self, raw: bool) -> CompileResult {
+        let [normal, throw, ret] = self.emit_multi_jump(Operation::Yield(raw as u8));
+        self.patch_from_end(throw);
+        self.emit_op(Operation::Throw);
+        self.patch_from_end(ret);
+        self.emit_generator_return()?;
+        self.patch_from_end(normal);
+        Ok(())
+    }
+
+    /// Emit an instruction ending in N u32 forward offsets, each counted from the end of
+    /// the instruction. Returns (instruction end, operand position) pairs to patch.
+    fn emit_multi_jump<const N: usize>(&mut self, op: Operation) -> [(usize, usize); N] {
+        self.emit_op(op);
+        let end = self.bytecode.len();
+        std::array::from_fn(|i| (end, end - 4 * (N - i)))
+    }
+
+    /// Point an offset from `emit_multi_jump` at the current end of the bytecode.
+    fn patch_from_end(&mut self, (end, pos): (usize, usize)) {
+        let offset = (self.bytecode.len() - end) as u32;
+        self.bytecode[pos..pos + 4].copy_from_slice(&offset.to_le_bytes());
+    }
+
+    /// [value] -> return it from the generator (an async generator awaits it first).
+    fn emit_generator_return(&mut self) -> CompileResult {
+        if self.coroutine == Coroutine::AsyncGenerator {
+            self.emit_await();
+        }
+        self.emit_unwind_tries(0)?;
+        self.emit_op(Operation::Return);
+        Ok(())
+    }
+
+    fn compile_yield(&mut self, expr: &YieldExpr) -> CompileResult {
+        if !expr.delegate {
+            match &expr.arg {
+                Some(arg) => self.compile_expr(arg)?,
+                None => self.emit_op(Operation::Undefined),
+            }
+            // an async generator awaits what it yields
+            if self.coroutine == Coroutine::AsyncGenerator {
+                self.emit_await();
+            }
+            return self.emit_yield(false);
+        }
+
+        // `yield* inner`: pass each next / throw / return on to inner's iterator, yielding
+        // its results, until it's done (its final value is the result)
+        let is_async = self.coroutine.is_async();
+        let iterator = self.alloc_slot()?;
+        let mode = self.alloc_slot()?;
+        let arg = expr.arg.as_deref().expect("yield* always has an argument");
+        self.compile_expr(arg)?;
+        self.emit_op(if is_async {
+            Operation::GetAsyncIterator
+        } else {
+            Operation::GetIterator
+        });
+        self.emit_op(Operation::SetLocal(iterator));
+        self.emit_op(Operation::Pop);
+        self.emit_set_mode(mode, 0);
+        // the first value passed on is `undefined`
+        self.emit_op(Operation::Undefined);
+
+        let start = self.bytecode.len();
+        // [received] -> [inner result]
+        let no_return = self.emit_jump(Operation::DelegateCall(iterator, mode, 0));
+        if is_async {
+            self.emit_await();
+        }
+        // done: [value] -> the result, or the generator's return value (mode 2)
+        let [done, ret] = self.emit_multi_jump(Operation::DelegateResult(mode, is_async as u8));
+        let [normal, throw, resumed_return] = self.emit_multi_jump(Operation::Yield(!is_async as u8));
+        for (resume, m) in [(throw, 1), (resumed_return, 2), (normal, 0)] {
+            self.patch_from_end(resume);
+            self.emit_set_mode(mode, m);
+            self.emit_loop(start);
+        }
+
+        // inner is done with a `return(v)`, or has no `return`: return v from here
+        self.patch_jump(no_return);
+        self.patch_from_end(ret);
+        self.emit_generator_return()?;
+        self.patch_from_end(done);
+        Ok(())
+    }
+
+    /// Store a `yield*` resume mode (0 next, 1 throw, 2 return) in its slot.
+    fn emit_set_mode(&mut self, slot: u8, mode: u8) {
+        self.emit_op(Operation::LoadFloat64(mode as f64));
+        self.emit_op(Operation::SetLocal(slot));
+        self.emit_op(Operation::Pop);
+    }
+
+    // ---------------------------------------------------------------------------------
+    // optional chaining
+    // ---------------------------------------------------------------------------------
+
+    /// Compile one link of an optional chain (`a?.b.c()`). A `?.` that finds null /
+    /// undefined jumps (collected in `nullish`) to the end of the whole chain, with one
+    /// value on the stack. With `method`, a member link pushes [obj, value] for a call.
+    fn compile_chain(
+        &mut self,
+        chain: &OptChainExpr,
+        nullish: &mut Vec<usize>,
+        method: bool,
+    ) -> CompileResult {
+        match &*chain.base {
+            OptChainBase::Member(member) => {
+                self.compile_chain_part(&member.obj, nullish)?;
+                if chain.optional {
+                    nullish.push(self.emit_jump(Operation::JumpIfNullish(0)));
+                }
+                if method {
+                    self.emit_op(Operation::Dup);
+                }
+                let access = self.compile_member_prop(&member.prop)?;
+                self.emit_member_get(access);
+            }
+            OptChainBase::Call(call) => {
+                let is_method = self.compile_chain_callee(&call.callee, nullish)?;
+                if chain.optional {
+                    if is_method {
+                        // [obj, f]: leave one value for the end of the chain
+                        let call_it = self.emit_jump(Operation::JumpIfNotNullish(0));
+                        self.emit_op(Operation::Pop);
+                        nullish.push(self.emit_jump(Operation::Jump(0)));
+                        self.patch_jump(call_it);
+                    } else {
+                        nullish.push(self.emit_jump(Operation::JumpIfNullish(0)));
+                    }
+                }
+                self.compile_args(&call.args)?;
+                self.emit_op(if is_method {
+                    Operation::CallMethod
+                } else {
+                    Operation::Call
+                });
+                if method {
+                    unreachable!("a call is never used as a method receiver link");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// An expression inside a chain: further links stay part of the same chain.
+    fn compile_chain_part(&mut self, expr: &Expr, nullish: &mut Vec<usize>) -> CompileResult {
+        match expr {
+            Expr::OptChain(chain) => self.compile_chain(chain, nullish, false),
+            _ => self.compile_expr(expr),
+        }
+    }
+
+    /// Push a chain call's callee: [obj, f] for a method call (returns true), else [f].
+    fn compile_chain_callee(&mut self, callee: &Expr, nullish: &mut Vec<usize>) -> CompileResult<bool> {
+        match callee {
+            Expr::OptChain(chain) if matches!(&*chain.base, OptChainBase::Member(_)) => {
+                self.compile_chain(chain, nullish, true)?;
+                Ok(true)
+            }
+            Expr::Member(member) => {
+                self.compile_expr(&member.obj)?;
+                self.emit_op(Operation::Dup);
+                let access = self.compile_member_prop(&member.prop)?;
+                self.emit_member_get(access);
+                Ok(true)
+            }
+            Expr::SuperProp(super_prop) => {
+                self.emit_op(Operation::This);
+                self.compile_super_prop(&super_prop.prop)?;
+                self.emit_op(Operation::SuperGet);
+                Ok(true)
+            }
+            _ => {
+                self.compile_chain_part(callee, nullish)?;
+                Ok(false)
+            }
+        }
+    }
+
+    /// Land a chain's short-circuit jumps: their value is replaced by `result`.
+    fn end_chain(&mut self, nullish: Vec<usize>, result: Operation) {
+        if nullish.is_empty() {
+            return;
+        }
+        let end = self.emit_jump(Operation::Jump(0));
+        for jump in nullish {
+            self.patch_jump(jump);
+        }
+        self.emit_op(Operation::Pop);
+        self.emit_op(result);
+        self.patch_jump(end);
+    }
+
+    /// Compile an expression whose value is unused, then drop it. `x++` becomes `++x`
+    /// (no old value to keep), and each part of `a, b` is dropped as it goes.
+    fn compile_discarded(&mut self, expr: &Expr) -> CompileResult {
+        match expr {
+            Expr::Update(update) if !update.prefix => {
+                let prefix = UpdateExpr {
+                    prefix: true,
+                    ..update.clone()
+                };
+                self.compile_update_expr(&prefix)?;
+            }
+            Expr::Seq(seq) => {
+                for expr in &seq.exprs {
+                    self.compile_discarded(expr)?;
+                }
+                return Ok(());
+            }
+            _ => self.compile_expr(expr)?,
+        }
+        self.emit_op(Operation::Pop);
         Ok(())
     }
 
@@ -1273,9 +2600,10 @@ impl<'a> Compiler<'a> {
     }
 
     fn compile_update_expr(&mut self, expr: &UpdateExpr) -> CompileResult {
-        let step = match expr.op {
-            UpdateOp::PlusPlus => Operation::Add,
-            UpdateOp::MinusMinus => Operation::Sub,
+        // `++` / `--` convert to a number (or keep a BigInt) and step by one
+        let step = || match expr.op {
+            UpdateOp::PlusPlus => Operation::Increment,
+            UpdateOp::MinusMinus => Operation::Decrement,
         };
         let mut arg = &*expr.arg;
         while let Expr::Paren(paren) = arg {
@@ -1284,13 +2612,15 @@ impl<'a> Compiler<'a> {
         match arg {
             Expr::Ident(ident) => {
                 self.emit_get_var(ident)?;
-                self.emit_op(Operation::UnaryPlus);
+                if !expr.prefix {
+                    // the result is the old value, converted
+                    self.emit_op(Operation::ToNumeric);
+                }
                 if !expr.prefix {
                     // keep the old (numeric) value as the result
                     self.emit_op(Operation::Dup);
                 }
-                self.emit_op(Operation::LoadFloat64(1.0));
-                self.emit_op(step);
+                self.emit_op(step());
                 self.emit_set_var(ident)?;
                 if !expr.prefix {
                     self.emit_op(Operation::Pop);
@@ -1299,17 +2629,48 @@ impl<'a> Compiler<'a> {
             Expr::Member(member_expr) => {
                 // [obj, key] -> [obj, key, obj, key] -> [obj, key, value]
                 self.compile_expr(&member_expr.obj)?;
-                self.compile_member_prop(&member_expr.prop)?;
+                let access = self.compile_member_prop(&member_expr.prop)?;
+                self.emit_key_once(&member_expr.prop);
                 self.emit_op(Operation::Dup2);
-                self.emit_op(Operation::GetProperty);
-                self.emit_op(Operation::UnaryPlus);
-                let temp = if expr.prefix { None } else { Some(self.temp()?) };
+                self.emit_member_get(access);
+                if !expr.prefix {
+                    // the result is the old value, converted
+                    self.emit_op(Operation::ToNumeric);
+                }
+                let temp = if expr.prefix {
+                    None
+                } else {
+                    Some(self.temp()?)
+                };
                 if let Some(temp) = temp {
                     self.emit_op(Operation::SetLocal(temp));
                 }
-                self.emit_op(Operation::LoadFloat64(1.0));
-                self.emit_op(step);
-                self.emit_op(Operation::SetProperty);
+                self.emit_op(step());
+                self.emit_member_set(access);
+                if let Some(temp) = temp {
+                    self.emit_op(Operation::Pop);
+                    self.emit_op(Operation::GetLocal(temp));
+                }
+            }
+            Expr::SuperProp(super_prop) => {
+                // [key] -> [key, key] -> [key, value]
+                self.compile_super_prop(&super_prop.prop)?;
+                self.emit_op(Operation::Dup);
+                self.emit_op(Operation::SuperGet);
+                if !expr.prefix {
+                    // the result is the old value, converted
+                    self.emit_op(Operation::ToNumeric);
+                }
+                let temp = if expr.prefix {
+                    None
+                } else {
+                    Some(self.temp()?)
+                };
+                if let Some(temp) = temp {
+                    self.emit_op(Operation::SetLocal(temp));
+                }
+                self.emit_op(step());
+                self.emit_op(Operation::SuperSet);
                 if let Some(temp) = temp {
                     self.emit_op(Operation::Pop);
                     self.emit_op(Operation::GetLocal(temp));
@@ -1328,17 +2689,29 @@ impl<'a> Compiler<'a> {
             AssignTarget::Simple(SimpleAssignTarget::Member(member_expr)) => {
                 // stack: [obj, key, value]
                 self.compile_expr(&member_expr.obj)?;
-                self.compile_member_prop(&member_expr.prop)?;
+                let access = self.compile_member_prop(&member_expr.prop)?;
                 self.compile_expr(&expr.right)?;
-                self.emit_op(Operation::SetProperty);
+                self.emit_member_set(access);
+            }
+            AssignTarget::Simple(SimpleAssignTarget::SuperProp(super_prop)) => {
+                self.compile_super_prop(&super_prop.prop)?;
+                self.compile_expr(&expr.right)?;
+                self.emit_op(Operation::SuperSet);
             }
             AssignTarget::Simple(SimpleAssignTarget::Ident(ident)) => {
-                self.compile_expr(&expr.right)?;
+                self.compile_expr_named(&expr.right, &ident.id.sym)?;
                 self.emit_set_var(&ident.id)?;
             }
+            // the expression's value is the right-hand side
             AssignTarget::Pat(AssignTargetPat::Array(array_pat)) => {
                 self.compile_expr(&expr.right)?;
-                self.compile_array_destructuring(array_pat)?;
+                self.emit_op(Operation::Dup);
+                self.compile_array_pattern(array_pat, false)?;
+            }
+            AssignTarget::Pat(AssignTargetPat::Object(object_pat)) => {
+                self.compile_expr(&expr.right)?;
+                self.emit_op(Operation::Dup);
+                self.compile_object_pattern(object_pat, false)?;
             }
             target => return unsupported("assignment target", target.span()),
         }
@@ -1376,7 +2749,7 @@ impl<'a> Compiler<'a> {
                 if let Some(jump_op) = short_circuit {
                     let end = self.emit_jump(jump_op);
                     self.emit_op(Operation::Pop);
-                    self.compile_expr(&expr.right)?;
+                    self.compile_expr_named(&expr.right, &ident.sym)?;
                     self.emit_set_var(ident)?;
                     self.patch_jump(end);
                 } else if let Some(op) = arithmetic {
@@ -1388,14 +2761,15 @@ impl<'a> Compiler<'a> {
             AssignTarget::Simple(SimpleAssignTarget::Member(member_expr)) => {
                 // [obj, key] -> [obj, key, obj, key] -> [obj, key, value]
                 self.compile_expr(&member_expr.obj)?;
-                self.compile_member_prop(&member_expr.prop)?;
+                let access = self.compile_member_prop(&member_expr.prop)?;
+                self.emit_key_once(&member_expr.prop);
                 self.emit_op(Operation::Dup2);
-                self.emit_op(Operation::GetProperty);
+                self.emit_member_get(access);
                 if let Some(jump_op) = short_circuit {
                     let keep = self.emit_jump(jump_op);
                     self.emit_op(Operation::Pop);
                     self.compile_expr(&expr.right)?;
-                    self.emit_op(Operation::SetProperty);
+                    self.emit_member_set(access);
                     let end = self.emit_jump(Operation::Jump(0));
                     // not assigning: drop [obj, key] from under the value
                     self.patch_jump(keep);
@@ -1409,7 +2783,32 @@ impl<'a> Compiler<'a> {
                 } else if let Some(op) = arithmetic {
                     self.compile_expr(&expr.right)?;
                     self.emit_op(op);
-                    self.emit_op(Operation::SetProperty);
+                    self.emit_member_set(access);
+                }
+            }
+            AssignTarget::Simple(SimpleAssignTarget::SuperProp(super_prop)) => {
+                // [key] -> [key, key] -> [key, value]
+                self.compile_super_prop(&super_prop.prop)?;
+                self.emit_op(Operation::Dup);
+                self.emit_op(Operation::SuperGet);
+                if let Some(jump_op) = short_circuit {
+                    let keep = self.emit_jump(jump_op);
+                    self.emit_op(Operation::Pop);
+                    self.compile_expr(&expr.right)?;
+                    self.emit_op(Operation::SuperSet);
+                    let end = self.emit_jump(Operation::Jump(0));
+                    // not assigning: drop the key from under the value
+                    self.patch_jump(keep);
+                    let temp = self.temp()?;
+                    self.emit_op(Operation::SetLocal(temp));
+                    self.emit_op(Operation::Pop);
+                    self.emit_op(Operation::Pop);
+                    self.emit_op(Operation::GetLocal(temp));
+                    self.patch_jump(end);
+                } else if let Some(op) = arithmetic {
+                    self.compile_expr(&expr.right)?;
+                    self.emit_op(op);
+                    self.emit_op(Operation::SuperSet);
                 }
             }
             target => return unsupported("compound assignment target", target.span()),
@@ -1418,6 +2817,9 @@ impl<'a> Compiler<'a> {
     }
 
     fn compile_array_lit(&mut self, array_lit: &ArrayLit) -> CompileResult {
+        if array_lit.elems.iter().flatten().any(|e| e.spread.is_some()) {
+            return self.compile_spread_array(&array_lit.elems);
+        }
         for elem in &array_lit.elems {
             match elem {
                 Some(expr_or_spread) => {
@@ -1434,45 +2836,629 @@ impl<'a> Compiler<'a> {
     }
 
     fn compile_object_lit(&mut self, object_lit: &ObjectLit) -> CompileResult {
-        for prop in &object_lit.props {
-            let PropOrSpread::Prop(prop) = prop else {
-                return unsupported("object spread", prop.span());
-            };
-            let Prop::KeyValue(key_value) = &**prop else {
-                return unsupported("object property kind", prop.span());
-            };
-            match &key_value.key {
-                PropName::Ident(ident) => self.emit_op(load_str(&ident.sym)),
-                PropName::Str(s) => self.emit_op(Operation::LoadString(s.value.as_bytes().to_vec())),
-                // the VM converts the number to a key the same way JS does
-                PropName::Num(n) => self.emit_op(Operation::LoadFloat64(n.value)),
-                PropName::Computed(computed) => self.compile_expr(&computed.expr)?,
-                key => return unsupported("object key", key.span()),
+        // leading plain, shorthand and method properties are built in one step; the rest
+        // (from the first accessor, spread or `__proto__`) are added one at a time, in order
+        let simple = object_lit
+            .props
+            .iter()
+            .take_while(|p| {
+                matches!(p, PropOrSpread::Prop(prop)
+                    if matches!(&**prop, Prop::Shorthand(_) | Prop::Method(_))
+                        || matches!(&**prop, Prop::KeyValue(kv) if !is_proto_key(&kv.key)))
+            })
+            .count();
+        for prop in &object_lit.props[..simple] {
+            if let PropOrSpread::Prop(prop) = prop {
+                self.compile_prop(prop)?;
             }
-            self.compile_expr(&key_value.value)?;
         }
-        self.emit_op(Operation::Object(object_lit.props.len() as u32));
+        self.emit_op(Operation::Object(simple as u32));
+        for prop in &object_lit.props[simple..] {
+            let prop = match prop {
+                PropOrSpread::Spread(spread) => {
+                    self.compile_expr(&spread.expr)?;
+                    self.emit_op(Operation::ObjectSpread);
+                    continue;
+                }
+                PropOrSpread::Prop(prop) => &**prop,
+            };
+            match prop {
+                Prop::Getter(getter) => {
+                    self.compile_method(&getter.key, &getter.function, 1)?;
+                    self.emit_op(Operation::DefineAccessor(0));
+                }
+                Prop::Setter(setter) => {
+                    self.compile_method(&setter.key, &setter.function, 2)?;
+                    self.emit_op(Operation::DefineAccessor(1));
+                }
+                // `__proto__: value` sets the prototype rather than defining a property (and
+                // doesn't name an anonymous function value)
+                Prop::KeyValue(key_value) if is_proto_key(&key_value.key) => {
+                    self.emit_op(Operation::Dup);
+                    self.compile_prop_name(&key_value.key)?;
+                    self.compile_expr(&key_value.value)?;
+                    self.emit_op(Operation::SetProperty);
+                    self.emit_op(Operation::Pop);
+                }
+                _ => {
+                    self.compile_prop(prop)?;
+                    self.emit_op(Operation::DefineField);
+                }
+            }
+        }
         Ok(())
     }
 
-    fn compile_array_destructuring(&mut self, array_pat: &ArrayPat) -> CompileResult {
-        // the value to destructure is on top of the stack
+    /// Push a key-value, shorthand or method property's key and value.
+    fn compile_prop(&mut self, prop: &Prop) -> CompileResult {
+        match prop {
+            Prop::KeyValue(key_value) => {
+                self.compile_prop_name(&key_value.key)?;
+                match static_key_name(&key_value.key) {
+                    Some(name) => self.compile_expr_named(&key_value.value, &name)?,
+                    None => {
+                        self.compile_expr(&key_value.value)?;
+                        if is_anonymous_fn(&key_value.value) {
+                            self.emit_op(Operation::SetFunctionName(0));
+                        }
+                    }
+                }
+            }
+            Prop::Shorthand(ident) => {
+                self.emit_op(load_str(&ident.sym));
+                self.emit_get_var(ident)?;
+            }
+            Prop::Method(method) => self.compile_method(&method.key, &method.function, 0)?,
+            prop => return unsupported("object property kind", prop.span()),
+        }
+        Ok(())
+    }
+
+    /// Push a method's key and function. `prefix` 1 / 2 names it as a getter / setter.
+    fn compile_method(&mut self, key: &PropName, function: &Function, prefix: u8) -> CompileResult {
+        self.compile_prop_name(key)?;
+        let name = static_key_name(key).map(|name| match prefix {
+            1 => format!("get {name}"),
+            2 => format!("set {name}"),
+            _ => name,
+        });
+        self.compile_fn_value(name.as_deref(), None, function, false, FnKind::Method)?;
+        if name.is_none() {
+            self.emit_op(Operation::SetFunctionName(prefix));
+        }
+        Ok(())
+    }
+
+    /// Compile `expr`, naming it `name` if it's an anonymous function (`let f = () => {}`).
+    fn compile_expr_named(&mut self, expr: &Expr, name: &str) -> CompileResult {
+        let mut unwrapped = expr;
+        while let Expr::Paren(paren) = unwrapped {
+            unwrapped = &paren.expr;
+        }
+        match unwrapped {
+            Expr::Fn(fn_expr) if fn_expr.ident.is_none() => {
+                self.compile_fn_value(Some(name), None, &fn_expr.function, false, FnKind::Normal)
+            }
+            Expr::Arrow(arrow) => self.compile_arrow(arrow, Some(name), false),
+            Expr::Class(class_expr) if class_expr.ident.is_none() => {
+                self.compile_class(None, &class_expr.class, Some(name))
+            }
+            _ => self.compile_expr(expr),
+        }
+    }
+
+    // ---------------------------------------------------------------------------------
+    // classes
+    // ---------------------------------------------------------------------------------
+
+    /// Push a class. `ident` is the class's own name, bound (read-only) inside its body;
+    /// `name` is its `name` property (the own name, or one inferred from where it's stored).
+    fn compile_class(
+        &mut self,
+        ident: Option<&Ident>,
+        class: &Class,
+        name: Option<&str>,
+    ) -> CompileResult {
+        let outer = self.class_anchor.replace(class.span.lo);
+        let compiled = self.compile_class_body(ident, class, name);
+        self.class_anchor = outer;
+        compiled
+    }
+
+    fn compile_class_body(
+        &mut self,
+        ident: Option<&Ident>,
+        class: &Class,
+        name: Option<&str>,
+    ) -> CompileResult {
+        self.enter_scope();
+        let inner = match ident {
+            Some(ident) => {
+                let slot = self.declare_variable(ident.sym.to_string())?;
+                self.locals.last_mut().unwrap().read_only = true;
+                // `class A extends A` can't use it; methods (made later) always can
+                let body_start = class.super_class.as_ref().map_or(ident.span.hi, |s| s.span().hi);
+                self.mark_tdz(body_start);
+                Some(slot)
+            }
+            None => None,
+        };
+
+        // [superclass?, constructor] -> MakeClass -> [class]
+        let derived = class.super_class.is_some();
+        if let Some(super_class) = &class.super_class {
+            self.compile_expr(super_class)?;
+        }
+
+        // the body's private names are fresh each time the class is evaluated; the
+        // superclass expression above still sees the outer ones
+        for (key, kind) in class_private_names(class)? {
+            let slot = self.declare_variable(key)?;
+            self.locals.last_mut().unwrap().private = Some(kind);
+            self.emit_op(Operation::NewPrivateName(kind as u8));
+            self.emit_store_slot(slot);
+            self.emit_op(Operation::Pop);
+        }
+        let constructor = class.body.iter().find_map(|m| match m {
+            ClassMember::Constructor(c) => Some(c),
+            _ => None,
+        });
+        let kind = if derived {
+            FnKind::DerivedClass
+        } else {
+            FnKind::BaseClass
+        };
+        match constructor {
+            Some(constructor) => {
+                let mut params = Vec::new();
+                for param in &constructor.params {
+                    match param {
+                        ParamOrTsParamProp::Param(param) => params.push(&param.pat),
+                        ParamOrTsParamProp::TsParamProp(p) => {
+                            return unsupported("parameter property", p.span)
+                        }
+                    }
+                }
+                let body = match &constructor.body {
+                    Some(body) => FnBody::Block(&body.stmts),
+                    None => FnBody::Block(&[]),
+                };
+                self.compile_closure(name, None, &params, &body, false, kind, Coroutine::None)?;
+            }
+            // `constructor(...args) { super(...args); }` for derived classes
+            None if derived => {
+                self.compile_closure(name, None, &[], &FnBody::DefaultDerived, false, kind, Coroutine::None)?
+            }
+            None => self.compile_closure(name, None, &[], &FnBody::Block(&[]), false, kind, Coroutine::None)?,
+        }
+        self.emit_op(Operation::MakeClass(derived as u8));
+
+        // methods and accessors, then instance fields (initialised on construction)
+        let mut statics = Vec::new();
+        let mut instance_fields = Vec::new();
+        for member in &class.body {
+            match member {
+                ClassMember::Constructor(_) | ClassMember::Empty(_) => {}
+                ClassMember::Method(method) => {
+                    // [class] -> [class, target]
+                    self.emit_op(Operation::Dup);
+                    if !method.is_static {
+                        self.emit_op(load_str("prototype"));
+                        self.emit_op(Operation::GetProperty);
+                    }
+                    let kind = match method.kind {
+                        MethodKind::Method => 0,
+                        MethodKind::Getter => 1,
+                        MethodKind::Setter => 2,
+                    };
+                    self.compile_method(&method.key, &method.function, kind)?;
+                    self.emit_op(Operation::DefineMethod(kind));
+                }
+                ClassMember::ClassProp(prop) if prop.is_static => {
+                    // a computed key is evaluated (and converted) in source order, its
+                    // value later with the other static initialisers
+                    let key_slot = match &prop.key {
+                        PropName::Computed(_) => {
+                            let slot = self.alloc_slot()?;
+                            self.compile_prop_name(&prop.key)?;
+                            self.emit_op(Operation::ToPropertyKey);
+                            self.emit_op(Operation::SetLocal(slot));
+                            self.emit_op(Operation::Pop);
+                            Some(slot)
+                        }
+                        _ => None,
+                    };
+                    statics.push((member, key_slot));
+                }
+                ClassMember::ClassProp(prop) => {
+                    // the key now; the value when an instance is set up
+                    self.emit_op(Operation::Dup);
+                    self.compile_prop_name(&prop.key)?;
+                    self.emit_op(Operation::ClassField);
+                    instance_fields.push(FieldInit {
+                        value: prop.value.as_deref(),
+                        name: static_key_name(&prop.key),
+                    });
+                }
+                ClassMember::StaticBlock(_) => statics.push((member, None)),
+                ClassMember::PrivateMethod(method) => {
+                    // [class] -> [class, class, name, fn] -> [class]
+                    self.emit_op(Operation::Dup);
+                    self.emit_private_name(&method.key)?;
+                    let key = private_key(&method.key);
+                    let (kind, name) = match method.kind {
+                        MethodKind::Method => (0, key),
+                        MethodKind::Getter => (1, format!("get {key}")),
+                        MethodKind::Setter => (2, format!("set {key}")),
+                    };
+                    // accessors are only ever called by the VM; a method only needs a host
+                    // wrapper if it's used as a value (all its uses are in this class body)
+                    let internal = kind != 0 || !private_method_escapes(&method.key, class);
+                    self.compile_fn_value(
+                        Some(&name),
+                        None,
+                        &method.function,
+                        internal,
+                        FnKind::Method,
+                    )?;
+                    let static_flag = if method.is_static { 4 } else { 0 };
+                    self.emit_op(Operation::DefinePrivateMethod(kind | static_flag));
+                }
+                ClassMember::PrivateProp(prop) if prop.is_static => statics.push((member, None)),
+                ClassMember::PrivateProp(prop) => {
+                    self.emit_op(Operation::Dup);
+                    self.emit_private_name(&prop.key)?;
+                    self.emit_op(Operation::ClassField);
+                    instance_fields.push(FieldInit {
+                        value: prop.value.as_deref(),
+                        name: Some(private_key(&prop.key)),
+                    });
+                }
+                member => return unsupported("class member", member.span()),
+            }
+        }
+
+        // all instance field values are set up by one hidden method, run on each new instance
+        if !instance_fields.is_empty() {
+            self.emit_op(Operation::Dup);
+            let body = FnBody::InstanceFields(&instance_fields);
+            self.compile_closure(None, None, &[], &body, true, FnKind::Method, Coroutine::None)?;
+            self.emit_op(Operation::ClassInit);
+        }
+
+        // the class's own name is usable from here on (static initialisers can use it)
+        if let Some(slot) = inner {
+            self.emit_store_slot(slot);
+        }
+
+        // static fields and blocks run in order, with `this` as the class
+        for (member, key_slot) in statics {
+            self.emit_op(Operation::Dup);
+            match member {
+                ClassMember::ClassProp(prop) => {
+                    match key_slot {
+                        Some(slot) => self.emit_op(Operation::GetLocal(slot)),
+                        None => self.compile_prop_name(&prop.key)?,
+                    }
+                    self.compile_field_init(static_key_name(&prop.key), prop.value.as_deref())?;
+                    self.emit_op(Operation::StaticField);
+                }
+                ClassMember::PrivateProp(prop) => {
+                    self.compile_private_field(prop)?;
+                    self.emit_op(Operation::StaticField);
+                }
+                ClassMember::StaticBlock(block) => {
+                    let body = FnBody::Block(&block.body.stmts);
+                    self.compile_closure(None, None, &[], &body, true, FnKind::Method, Coroutine::None)?;
+                    self.emit_op(Operation::StaticBlock);
+                }
+                _ => unreachable!(),
+            }
+        }
+        self.exit_scope();
+        Ok(())
+    }
+
+    /// Push a private field's name object and initialiser.
+    fn compile_private_field(&mut self, prop: &PrivateProp) -> CompileResult {
+        self.emit_private_name(&prop.key)?;
+        self.compile_field_init(Some(private_key(&prop.key)), prop.value.as_deref())
+    }
+
+    /// Push a field's initialiser: a hidden method returning the value (run with `this` as
+    /// the instance, or the class for static fields), or `undefined` for `x;`. `name` names
+    /// an anonymous function value.
+    fn compile_field_init(&mut self, name: Option<String>, value: Option<&Expr>) -> CompileResult {
+        match value {
+            Some(value) => {
+                let body = FnBody::Field(value, name);
+                self.compile_closure(None, None, &[], &body, true, FnKind::Method, Coroutine::None)
+            }
+            None => {
+                self.emit_op(Operation::Undefined);
+                Ok(())
+            }
+        }
+    }
+
+    /// Push the key of `super.x` / `super[x]`.
+    fn compile_super_prop(&mut self, prop: &SuperProp) -> CompileResult {
+        match prop {
+            SuperProp::Ident(ident) => self.emit_op(load_str(&ident.sym)),
+            SuperProp::Computed(computed) => self.compile_expr(&computed.expr)?,
+        }
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------------------------
+    // templates
+    // ---------------------------------------------------------------------------------
+
+    fn compile_tpl(&mut self, tpl: &Tpl) -> CompileResult {
+        for (i, quasi) in tpl.quasis.iter().enumerate() {
+            let Some(cooked) = &quasi.cooked else {
+                return unsupported("invalid escape in template", quasi.span);
+            };
+            self.emit_op(Operation::LoadString(cooked.as_bytes().to_vec()));
+            if let Some(expr) = tpl.exprs.get(i) {
+                self.compile_expr(expr)?;
+            }
+        }
+        if !tpl.exprs.is_empty() {
+            let parts = tpl.quasis.len() + tpl.exprs.len();
+            self.emit_op(Operation::Template(parts as u32));
+        }
+        Ok(())
+    }
+
+    /// ``tag`a${b}c` `` calls `tag(strings, b)`; ``obj.tag`...` `` passes obj as `this`.
+    fn compile_tagged_tpl(&mut self, tagged: &TaggedTpl) -> CompileResult {
+        let mut tag = &*tagged.tag;
+        while let Expr::Paren(paren) = tag {
+            tag = &paren.expr;
+        }
+        let is_method = if let Expr::Member(member_expr) = tag {
+            self.compile_expr(&member_expr.obj)?;
+            self.emit_op(Operation::Dup);
+            let access = self.compile_member_prop(&member_expr.prop)?;
+            self.emit_member_get(access);
+            true
+        } else {
+            self.compile_expr(&tagged.tag)?;
+            false
+        };
+        let pieces = tagged
+            .tpl
+            .quasis
+            .iter()
+            .map(|q| {
+                let cooked = q.cooked.as_ref().map(|c| c.as_bytes().to_vec());
+                (cooked, q.raw.as_bytes().to_vec())
+            })
+            .collect();
+        self.emit_op(Operation::TemplateObject(pieces));
+        for expr in &tagged.tpl.exprs {
+            self.compile_expr(expr)?;
+        }
+        self.emit_op(Operation::UInt64(tagged.tpl.exprs.len() as u64 + 1));
+        self.emit_op(if is_method {
+            Operation::CallMethod
+        } else {
+            Operation::Call
+        });
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------------------------
+    // destructuring
+    // ---------------------------------------------------------------------------------
+
+    /// Push a property key.
+    fn compile_prop_name(&mut self, key: &PropName) -> CompileResult {
+        match key {
+            PropName::Ident(ident) => self.emit_op(load_str(&ident.sym)),
+            PropName::Str(s) => self.emit_op(Operation::LoadString(s.value.as_bytes().to_vec())),
+            // the VM converts the number to a key the same way JS does
+            PropName::Num(n) => self.emit_op(Operation::LoadFloat64(n.value)),
+            PropName::Computed(computed) => self.compile_expr(&computed.expr)?,
+            key => return unsupported("object key", key.span()),
+        }
+        Ok(())
+    }
+
+    /// Replace the value on top of the stack with `default` if it is `undefined`. `name`
+    /// names an anonymous function default after its target.
+    fn emit_default(&mut self, default: &Expr, name: Option<&str>) -> CompileResult {
+        self.emit_op(Operation::Dup);
+        self.emit_op(Operation::Undefined);
+        self.emit_op(Operation::EqEqEq);
+        let skip = self.emit_jump(Operation::JumpIfFalse(0));
+        self.emit_op(Operation::Pop);
+        self.emit_op(Operation::Pop);
+        match name {
+            Some(name) => self.compile_expr_named(default, name)?,
+            None => self.compile_expr(default)?,
+        }
+        let end = self.emit_jump(Operation::Jump(0));
+        self.patch_jump(skip);
+        self.emit_op(Operation::Pop);
+        self.patch_jump(end);
+        Ok(())
+    }
+
+    /// Store the value on top of the stack into `pat`, consuming it. `init` initialises
+    /// declared names (so `const` is allowed); otherwise this is an assignment.
+    fn compile_pattern(&mut self, pat: &Pat, init: bool) -> CompileResult {
+        match pat {
+            Pat::Ident(ident) => {
+                if init {
+                    self.emit_init_var(&ident.id)?;
+                } else {
+                    self.emit_set_var(&ident.id)?;
+                }
+                self.emit_op(Operation::Pop);
+            }
+            Pat::Assign(assign) => {
+                let name = match &*assign.left {
+                    Pat::Ident(ident) => Some(&*ident.id.sym),
+                    _ => None,
+                };
+                self.emit_default(&assign.right, name)?;
+                self.compile_pattern(&assign.left, init)?;
+            }
+            Pat::Array(array_pat) => self.compile_array_pattern(array_pat, init)?,
+            Pat::Object(object_pat) => self.compile_object_pattern(object_pat, init)?,
+            // assignment targets: `[o.x, (y)] = ...`
+            Pat::Expr(expr) => {
+                let mut expr = &**expr;
+                while let Expr::Paren(paren) = expr {
+                    expr = &paren.expr;
+                }
+                match expr {
+                    Expr::Ident(ident) => {
+                        self.emit_set_var(ident)?;
+                        self.emit_op(Operation::Pop);
+                    }
+                    Expr::Member(member_expr) => {
+                        let value = self.alloc_slot()?;
+                        self.emit_op(Operation::SetLocal(value));
+                        self.emit_op(Operation::Pop);
+                        self.compile_expr(&member_expr.obj)?;
+                        let access = self.compile_member_prop(&member_expr.prop)?;
+                        self.emit_op(Operation::GetLocal(value));
+                        self.emit_member_set(access);
+                        self.emit_op(Operation::Pop);
+                    }
+                    Expr::SuperProp(super_prop) => {
+                        let value = self.alloc_slot()?;
+                        self.emit_op(Operation::SetLocal(value));
+                        self.emit_op(Operation::Pop);
+                        self.compile_super_prop(&super_prop.prop)?;
+                        self.emit_op(Operation::GetLocal(value));
+                        self.emit_op(Operation::SuperSet);
+                        self.emit_op(Operation::Pop);
+                    }
+                    expr => return unsupported("assignment target", expr.span()),
+                }
+            }
+            pat => return unsupported("pattern", pat.span()),
+        }
+        Ok(())
+    }
+
+    /// `[a, , b = 1, ...rest]`: the value is iterated (only as far as needed) into an array
+    /// held in a hidden slot, then each element is stored.
+    fn compile_array_pattern(&mut self, array_pat: &ArrayPat, init: bool) -> CompileResult {
+        let has_rest = matches!(array_pat.elems.last(), Some(Some(Pat::Rest(_))));
+        let count = if has_rest {
+            ITER_TAKE_ALL
+        } else {
+            array_pat.elems.len() as u32
+        };
+        let items = self.alloc_slot()?;
+        self.emit_op(Operation::IterTake(count));
+        self.emit_op(Operation::SetLocal(items));
+        self.emit_op(Operation::Pop);
         for (i, elem) in array_pat.elems.iter().enumerate() {
             let Some(pat) = elem else { continue };
-            let Pat::Ident(ident) = pat else {
-                return unsupported("destructuring pattern", pat.span());
-            };
-            let is_last = i == array_pat.elems.len() - 1;
-
-            // keep the array around for the next element
-            if !is_last {
-                self.emit_op(Operation::Dup);
+            if let Pat::Rest(rest) = pat {
+                self.emit_op(Operation::GetLocal(items));
+                self.emit_op(Operation::ArraySliceFrom(i as u32));
+                self.compile_pattern(&rest.arg, init)?;
+            } else {
+                self.emit_op(Operation::GetSlotIndex(items, i as u32));
+                self.compile_pattern(pat, init)?;
             }
-            self.emit_op(Operation::LoadFloat64(i as f64));
-            self.emit_op(Operation::GetProperty);
-            self.emit_set_var(&ident.id)?;
-            if !is_last {
-                self.emit_op(Operation::Pop);
+        }
+        Ok(())
+    }
+
+    /// `{ a, b: c, [k]: d = 1, ...rest }`: the value is held in a hidden slot while each
+    /// property is read and stored. With a rest element, the keys used are collected too.
+    fn compile_object_pattern(&mut self, object_pat: &ObjectPat, init: bool) -> CompileResult {
+        let source = self.alloc_slot()?;
+        self.emit_op(Operation::RequireObjectCoercible);
+        self.emit_op(Operation::SetLocal(source));
+        self.emit_op(Operation::Pop);
+
+        let has_rest = object_pat
+            .props
+            .iter()
+            .any(|p| matches!(p, ObjectPatProp::Rest(_)));
+        let used_keys = if has_rest {
+            let slot = self.alloc_slot()?;
+            self.emit_op(Operation::Array(0));
+            self.emit_op(Operation::SetLocal(slot));
+            self.emit_op(Operation::Pop);
+            Some(slot)
+        } else {
+            None
+        };
+
+        for prop in &object_pat.props {
+            match prop {
+                ObjectPatProp::KeyValue(key_value) if used_keys.is_none() => {
+                    // `{ a: x }`: one read
+                    match &key_value.key {
+                        PropName::Ident(ident) => self.emit_op(Operation::GetSlotProp(
+                            source,
+                            ident.sym.as_bytes().to_vec(),
+                        )),
+                        PropName::Str(s) => self.emit_op(Operation::GetSlotProp(
+                            source,
+                            s.value.as_bytes().to_vec(),
+                        )),
+                        key => {
+                            self.emit_op(Operation::GetLocal(source));
+                            self.compile_prop_name(key)?;
+                            self.emit_op(Operation::GetProperty);
+                        }
+                    }
+                    self.compile_pattern(&key_value.value, init)?;
+                }
+                ObjectPatProp::KeyValue(key_value) => {
+                    self.emit_op(Operation::GetLocal(source));
+                    self.compile_prop_name(&key_value.key)?;
+                    if let Some(used) = used_keys {
+                        // [source, key] -> record the key, keep it for the read
+                        self.emit_op(Operation::Dup);
+                        let key = self.alloc_slot()?;
+                        self.emit_op(Operation::SetLocal(key));
+                        self.emit_op(Operation::Pop);
+                        self.emit_op(Operation::GetLocal(used));
+                        self.emit_op(Operation::GetLocal(key));
+                        self.emit_op(Operation::ArrayAppend);
+                        self.emit_op(Operation::Pop);
+                    }
+                    self.emit_op(Operation::GetProperty);
+                    self.compile_pattern(&key_value.value, init)?;
+                }
+                ObjectPatProp::Assign(assign) => {
+                    // shorthand `{ a }` / `{ a = 1 }`
+                    let name = &assign.key.id;
+                    if let Some(used) = used_keys {
+                        self.emit_op(Operation::GetLocal(used));
+                        self.emit_op(load_str(&name.sym));
+                        self.emit_op(Operation::ArrayAppend);
+                        self.emit_op(Operation::Pop);
+                    }
+                    self.emit_op(Operation::GetSlotProp(source, name.sym.as_bytes().to_vec()));
+                    if let Some(default) = &assign.value {
+                        self.emit_default(default, Some(&name.sym))?;
+                    }
+                    if init {
+                        self.emit_init_var(name)?;
+                    } else {
+                        self.emit_set_var(name)?;
+                    }
+                    self.emit_op(Operation::Pop);
+                }
+                ObjectPatProp::Rest(rest) => {
+                    self.emit_op(Operation::GetLocal(source));
+                    self.emit_op(Operation::GetLocal(used_keys.expect("rest has a key list")));
+                    self.emit_op(Operation::ObjectRest);
+                    self.compile_pattern(&rest.arg, init)?;
+                }
             }
         }
         Ok(())
@@ -1492,6 +3478,14 @@ impl<'a> Compiler<'a> {
             self.emit_op(Operation::Pop);
             self.compile_expr(&expr.right)?;
             self.patch_jump(end);
+            return Ok(());
+        }
+
+        // `#x in obj`: a brand check
+        if let (BinaryOp::In, Expr::PrivateName(name)) = (expr.op, &*expr.left) {
+            self.emit_private_name(name)?;
+            self.compile_expr(&expr.right)?;
+            self.emit_op(Operation::PrivateIn);
             return Ok(());
         }
 
@@ -1531,9 +3525,30 @@ impl<'a> Compiler<'a> {
     fn compile_unary_expr(&mut self, expr: &UnaryExpr) -> CompileResult {
         if expr.op == UnaryOp::Delete {
             // `delete obj.key` needs the object and key, not the property value
+            // `delete a?.b`: true without deleting anything when `a` is null / undefined
+            if let Expr::OptChain(chain) = &*expr.arg {
+                if let OptChainBase::Member(member) = &*chain.base {
+                    let mut nullish = Vec::new();
+                    self.compile_chain_part(&member.obj, &mut nullish)?;
+                    if chain.optional {
+                        nullish.push(self.emit_jump(Operation::JumpIfNullish(0)));
+                    }
+                    self.compile_member_prop(&member.prop)?;
+                    self.emit_op(Operation::Delete);
+                    self.end_chain(nullish, Operation::Bool(true));
+                    return Ok(());
+                }
+            }
             let Expr::Member(member_expr) = &*expr.arg else {
-                return unsupported("delete of non-member expression", expr.span);
+                // `delete 1`, `delete f()`: evaluated for side effects, always true
+                self.compile_expr(&expr.arg)?;
+                self.emit_op(Operation::Pop);
+                self.emit_op(Operation::Bool(true));
+                return Ok(());
             };
+            if let MemberProp::PrivateName(name) = &member_expr.prop {
+                return unsupported("delete of a private name", name.span);
+            }
             self.compile_expr(&member_expr.obj)?;
             self.compile_member_prop(&member_expr.prop)?;
             self.emit_op(Operation::Delete);
@@ -1577,7 +3592,7 @@ impl<'a> Compiler<'a> {
             Lit::Regex(r) => {
                 self.emit_op(Operation::Regex(r.exp.to_string(), r.flags.to_string()));
             }
-            Lit::BigInt(b) => return unsupported("BigInt literal", b.span),
+            Lit::BigInt(b) => self.emit_op(Operation::LoadBigInt(b.value.to_string())),
             Lit::JSXText(j) => return unsupported("JSX", j.span),
         }
         Ok(())
@@ -1610,6 +3625,53 @@ impl<'a> Compiler<'a> {
         self.bytecode.push(op.get_opcode());
         match op {
             Operation::LoadString(bytes) => self.emit_string(&bytes),
+            Operation::LoadBigInt(digits) => self.emit_string(digits.as_bytes()),
+            Operation::IterNext(slot, offset) => {
+                self.bytecode.push(slot);
+                self.bytecode.extend_from_slice(&offset.to_le_bytes());
+            }
+            Operation::IterClose(slot, mode) => {
+                self.bytecode.push(slot);
+                self.bytecode.push(mode);
+            }
+            Operation::GetSlotIndex(slot, index) => {
+                self.bytecode.push(slot);
+                self.bytecode.extend_from_slice(&index.to_le_bytes());
+            }
+            Operation::GetSlotProp(slot, name) => {
+                self.bytecode.push(slot);
+                self.emit_string(&name);
+            }
+            Operation::InitField(index, name_it) => {
+                self.bytecode.extend_from_slice(&index.to_le_bytes());
+                self.bytecode.push(name_it);
+            }
+            Operation::Yield(raw) => {
+                self.bytecode.push(raw);
+                self.bytecode.extend_from_slice(&[0; 12]);
+            }
+            Operation::DelegateCall(iterator, mode, offset) => {
+                self.bytecode.push(iterator);
+                self.bytecode.push(mode);
+                self.bytecode.extend_from_slice(&offset.to_le_bytes());
+            }
+            Operation::DelegateResult(mode, is_async) => {
+                self.bytecode.push(mode);
+                self.bytecode.push(is_async);
+                self.bytecode.extend_from_slice(&[0; 8]);
+            }
+            Operation::AsyncIterNext(slot) | Operation::IterCloseCheck(slot) => {
+                self.bytecode.push(slot)
+            }
+            Operation::IterResult(slot, offset) => {
+                self.bytecode.push(slot);
+                self.bytecode.extend_from_slice(&offset.to_le_bytes());
+            }
+            Operation::AsyncIterClose(slot, mode, offset) => {
+                self.bytecode.push(slot);
+                self.bytecode.push(mode);
+                self.bytecode.extend_from_slice(&offset.to_le_bytes());
+            }
             Operation::LoadFloat64(n) => {
                 let bytes = n.to_le_bytes();
                 self.bytecode.extend_from_slice(&bytes);
@@ -1629,26 +3691,75 @@ impl<'a> Compiler<'a> {
                 self.bytecode.extend_from_slice(&low.to_le_bytes());
                 self.bytecode.extend_from_slice(&high.to_le_bytes());
             }
-            Operation::Function(arity, name, code, _) => {
-                self.bytecode.push(arity);
+            Operation::Function(FnInfo {
+                length,
+                params,
+                kind,
+                coroutine,
+                name,
+                captures,
+                code,
+                ..
+            }) => {
+                self.bytecode.push(length);
+                self.bytecode.push(params);
+                // kind, | 8 generator, | 16 async
+                self.bytecode.push(
+                    kind as u8
+                        | (coroutine.is_generator() as u8) << 3
+                        | (coroutine.is_async() as u8) << 4,
+                );
                 self.emit_string(name.as_bytes());
+                // captures: count, then (from_local, index) pairs
+                self.bytecode.push(captures.len() as u8);
+                for (from_local, index) in captures {
+                    self.bytecode.push(from_local as u8);
+                    self.bytecode.push(index);
+                }
                 let code_len = code.len() as u32;
                 self.bytecode.extend_from_slice(&code_len.to_le_bytes());
                 self.bytecode.extend_from_slice(&code);
             }
-            Operation::GetUpvalue(depth, index) | Operation::SetUpvalue(depth, index) => {
-                self.bytecode.push(depth);
-                self.bytecode.push(index);
+            Operation::GetUpvalue(index) | Operation::SetUpvalue(index) => {
+                self.bytecode.push(index)
             }
+            Operation::GetBox(slot)
+            | Operation::SetBox(slot)
+            | Operation::NewBox(slot)
+            | Operation::BoxLocal(slot)
+            | Operation::RenewBox(slot)
+            | Operation::NewBoxTdz(slot)
+            | Operation::Tdz(slot)
+            | Operation::RestArgs(slot) => self.bytecode.push(slot),
             Operation::HostGlobal(id) => self.bytecode.push(id),
-            Operation::GetLocal(index) | Operation::SetLocal(index) => self.bytecode.push(index),
-            Operation::Array(n) | Operation::Object(n) => {
-                self.bytecode.extend_from_slice(&n.to_le_bytes())
+            Operation::DefineAccessor(n)
+            | Operation::SetFunctionName(n)
+            | Operation::MakeClass(n)
+            | Operation::DefineMethod(n)
+            | Operation::NewPrivateName(n)
+            | Operation::DefinePrivateMethod(n) => self.bytecode.push(n),
+            Operation::TemplateObject(pieces) => {
+                self.bytecode
+                    .extend_from_slice(&(pieces.len() as u32).to_le_bytes());
+                for (cooked, raw) in pieces {
+                    self.bytecode.push(cooked.is_some() as u8);
+                    if let Some(cooked) = cooked {
+                        self.emit_string(&cooked);
+                    }
+                    self.emit_string(&raw);
+                }
             }
+            Operation::GetLocal(index) | Operation::SetLocal(index) => self.bytecode.push(index),
+            Operation::Array(n)
+            | Operation::Object(n)
+            | Operation::IterTake(n)
+            | Operation::ArraySliceFrom(n)
+            | Operation::Template(n) => self.bytecode.extend_from_slice(&n.to_le_bytes()),
             Operation::Jump(offset)
             | Operation::JumpIfFalse(offset)
             | Operation::JumpIfTrue(offset)
             | Operation::JumpIfNotNullish(offset)
+            | Operation::JumpIfNullish(offset)
             | Operation::Loop(offset)
             | Operation::TryStart(offset) => {
                 self.bytecode.extend_from_slice(&offset.to_le_bytes());
@@ -1673,7 +3784,6 @@ impl Default for Compiler<'_> {
 
 fn stmt_kind(stmt: &Stmt) -> &'static str {
     match stmt {
-        Stmt::ForOf(_) => "for-of loop",
         Stmt::With(_) => "with statement",
         Stmt::Decl(Decl::Class(_)) => "class declaration",
         Stmt::Decl(_) => "declaration",
@@ -1686,9 +3796,6 @@ fn expr_kind(expr: &Expr) -> &'static str {
         Expr::Arrow(_) => "arrow function",
         Expr::Class(_) => "class expression",
         Expr::Tpl(_) | Expr::TaggedTpl(_) => "template literal",
-        Expr::Yield(_) => "yield",
-        Expr::Await(_) => "await",
-        Expr::OptChain(_) => "optional chaining",
         Expr::SuperProp(_) => "super property",
         Expr::MetaProp(_) => "meta property",
         _ => "expression",
@@ -1704,8 +3811,8 @@ impl Visit for VarCollector<'_> {
     fn visit_var_decl(&mut self, n: &VarDecl) {
         if n.kind == VarDeclKind::Var {
             for decl in &n.decls {
-                if let Pat::Ident(ident) = &decl.name {
-                    self.names.push(ident.id.sym.to_string());
+                for ident in pat_idents(&decl.name) {
+                    self.names.push(ident.sym.to_string());
                 }
             }
         }
@@ -1722,7 +3829,10 @@ impl Visit for VarCollector<'_> {
 /// lets the value leave VM control. Shadowed names in nested scopes are counted too, which
 /// can only make the answer more cautious.
 fn fn_escapes(name: &str, stmts: &[&Stmt]) -> bool {
-    let mut scan = EscapeScan { name, escapes: false };
+    let mut scan = EscapeScan {
+        name,
+        escapes: false,
+    };
     for stmt in stmts {
         stmt.visit_with(&mut scan);
     }
@@ -1730,7 +3840,10 @@ fn fn_escapes(name: &str, stmts: &[&Stmt]) -> bool {
 }
 
 fn fn_escapes_in_function(name: &str, function: &Function) -> bool {
-    let mut scan = EscapeScan { name, escapes: false };
+    let mut scan = EscapeScan {
+        name,
+        escapes: false,
+    };
     function.visit_with(&mut scan);
     scan.escapes
 }
@@ -1771,5 +3884,227 @@ impl Visit for EscapeScan<'_> {
             }
         }
         n.visit_children_with(self);
+    }
+}
+
+/// Names used anywhere inside functions nested in `stmts` (not counting `stmts`' own code).
+/// A local with one of these names may be captured, so it's kept in a box. Matching by
+/// name alone ignores shadowing, which can only box more variables than needed.
+/// `params` count too: a default value can hold a closure.
+fn captured_names(params: &[&Pat], body: &FnBody, stmts: &[&Stmt]) -> HashSet<String> {
+    let mut scan = CaptureScan {
+        names: HashSet::new(),
+        fn_depth: 0,
+    };
+    for param in params {
+        param.visit_with(&mut scan);
+    }
+    if let FnBody::Expr(expr) | FnBody::Field(expr, _) = body {
+        expr.visit_with(&mut scan);
+    }
+    if let FnBody::InstanceFields(fields) = body {
+        for value in fields.iter().filter_map(|f| f.value) {
+            value.visit_with(&mut scan);
+        }
+    }
+    for stmt in stmts {
+        stmt.visit_with(&mut scan);
+    }
+    scan.names
+}
+
+struct CaptureScan {
+    names: HashSet<String>,
+    /// how many nested functions deep the visitor is
+    fn_depth: usize,
+}
+
+impl Visit for CaptureScan {
+    fn visit_function(&mut self, n: &Function) {
+        self.fn_depth += 1;
+        n.visit_children_with(self);
+        self.fn_depth -= 1;
+    }
+    fn visit_arrow_expr(&mut self, n: &ArrowExpr) {
+        self.fn_depth += 1;
+        n.visit_children_with(self);
+        self.fn_depth -= 1;
+    }
+    fn visit_constructor(&mut self, n: &Constructor) {
+        self.fn_depth += 1;
+        n.visit_children_with(self);
+        self.fn_depth -= 1;
+    }
+    fn visit_static_block(&mut self, n: &StaticBlock) {
+        self.fn_depth += 1;
+        n.visit_children_with(self);
+        self.fn_depth -= 1;
+    }
+    // a field's key is evaluated in the enclosing scope, its value in its own function
+    fn visit_class_prop(&mut self, n: &ClassProp) {
+        n.key.visit_with(self);
+        self.fn_depth += 1;
+        n.value.visit_with(self);
+        self.fn_depth -= 1;
+    }
+    fn visit_private_prop(&mut self, n: &PrivateProp) {
+        self.fn_depth += 1;
+        n.value.visit_with(self);
+        self.fn_depth -= 1;
+    }
+    // private names live in hidden locals named `#x`
+    fn visit_private_name(&mut self, n: &PrivateName) {
+        if self.fn_depth > 0 {
+            self.names.insert(private_key(n));
+        }
+    }
+    fn visit_ident(&mut self, n: &Ident) {
+        if self.fn_depth > 0 {
+            self.names.insert(n.sym.to_string());
+        }
+    }
+}
+
+/// The hidden local name for a private name: `#x` (can't clash with an identifier).
+fn private_key(name: &PrivateName) -> String {
+    format!("#{}", name.name)
+}
+
+/// The private names a class body declares, in source order, with what each one is.
+/// A getter and setter pair share one name.
+fn class_private_names(class: &Class) -> CompileResult<Vec<(String, PrivateKind)>> {
+    let mut names: Vec<(String, PrivateKind, bool)> = Vec::new();
+    for member in &class.body {
+        let (name, kind, is_static) = match member {
+            ClassMember::PrivateProp(p) => (&p.key, PrivateKind::Field, p.is_static),
+            ClassMember::PrivateMethod(m) if m.kind == MethodKind::Method => {
+                (&m.key, PrivateKind::Method, m.is_static)
+            }
+            ClassMember::PrivateMethod(m) => (&m.key, PrivateKind::Accessor, m.is_static),
+            _ => continue,
+        };
+        let key = private_key(name);
+        match names.iter().find(|(k, ..)| *k == key) {
+            None => names.push((key, kind, is_static)),
+            // the other half of an accessor pair
+            Some((_, PrivateKind::Accessor, s))
+                if kind == PrivateKind::Accessor && *s == is_static => {}
+            Some(_) => return unsupported(format!("duplicate private name `{key}`"), name.span),
+        }
+    }
+    Ok(names.into_iter().map(|(key, kind, _)| (key, kind)).collect())
+}
+
+/// Whether private method `name` is used other than by calling it (`x.#m(...)`) in the
+/// class body. Private names can only be used inside the class body, so this is exact
+/// (an inner class reusing the name only makes it more cautious).
+fn private_method_escapes(name: &PrivateName, class: &Class) -> bool {
+    let mut scan = PrivateEscapeScan {
+        name: &name.name,
+        escapes: false,
+    };
+    class.visit_with(&mut scan);
+    scan.escapes
+}
+
+struct PrivateEscapeScan<'n> {
+    name: &'n str,
+    escapes: bool,
+}
+
+impl PrivateEscapeScan<'_> {
+    fn is_name(&self, prop: &MemberProp) -> bool {
+        matches!(prop, MemberProp::PrivateName(p) if *p.name == *self.name)
+    }
+}
+
+impl Visit for PrivateEscapeScan<'_> {
+    fn visit_call_expr(&mut self, n: &CallExpr) {
+        let mut callee = match &n.callee {
+            Callee::Expr(callee) => &**callee,
+            _ => return n.visit_children_with(self),
+        };
+        while let Expr::Paren(paren) = callee {
+            callee = &paren.expr;
+        }
+        match callee {
+            // a method call doesn't let the function out
+            Expr::Member(member) if self.is_name(&member.prop) => {
+                member.obj.visit_with(self);
+                n.args.visit_with(self);
+            }
+            _ => n.visit_children_with(self),
+        }
+    }
+    fn visit_member_expr(&mut self, n: &MemberExpr) {
+        if self.is_name(&n.prop) {
+            self.escapes = true;
+        }
+        n.visit_children_with(self);
+    }
+}
+
+/// The names a binding pattern declares, in source order.
+fn pat_idents(pat: &Pat) -> Vec<&Ident> {
+    fn walk<'p>(pat: &'p Pat, out: &mut Vec<&'p Ident>) {
+        match pat {
+            Pat::Ident(ident) => out.push(&ident.id),
+            Pat::Array(array_pat) => {
+                for elem in array_pat.elems.iter().flatten() {
+                    walk(elem, out);
+                }
+            }
+            Pat::Object(object_pat) => {
+                for prop in &object_pat.props {
+                    match prop {
+                        ObjectPatProp::KeyValue(key_value) => walk(&key_value.value, out),
+                        ObjectPatProp::Assign(assign) => out.push(&assign.key.id),
+                        ObjectPatProp::Rest(rest) => walk(&rest.arg, out),
+                    }
+                }
+            }
+            Pat::Assign(assign) => walk(&assign.left, out),
+            Pat::Rest(rest) => walk(&rest.arg, out),
+            Pat::Expr(_) | Pat::Invalid(_) => {}
+        }
+    }
+    let mut out = Vec::new();
+    walk(pat, &mut out);
+    out
+}
+
+/// A property key known at compile time, as a function name (`None` for computed keys and
+/// numbers that need JS formatting).
+fn static_key_name(key: &PropName) -> Option<String> {
+    match key {
+        PropName::Ident(ident) => Some(ident.sym.to_string()),
+        PropName::Str(s) => Some(String::from_utf8_lossy(s.value.as_bytes()).into_owned()),
+        PropName::Num(n) if n.value.fract() == 0.0 && n.value < 1e21 => {
+            Some(format!("{}", n.value as u64))
+        }
+        _ => None,
+    }
+}
+
+/// A non-computed `__proto__` key.
+fn is_proto_key(key: &PropName) -> bool {
+    match key {
+        PropName::Ident(ident) => &*ident.sym == "__proto__",
+        PropName::Str(s) => s.value.as_bytes() == b"__proto__",
+        _ => false,
+    }
+}
+
+/// An unnamed function or arrow expression, which takes its name from where it's stored.
+fn is_anonymous_fn(expr: &Expr) -> bool {
+    let mut expr = expr;
+    while let Expr::Paren(paren) = expr {
+        expr = &paren.expr;
+    }
+    match expr {
+        Expr::Fn(f) => f.ident.is_none(),
+        Expr::Class(c) => c.ident.is_none(),
+        Expr::Arrow(_) => true,
+        _ => false,
     }
 }

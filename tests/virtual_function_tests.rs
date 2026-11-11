@@ -97,10 +97,22 @@ fn test_demo_example_script_runs() {
 fn test_internal_vs_escaping_function_opcode() {
     const HOST_CALLABLE: u8 = 0x37;
     const INTERNAL: u8 = 0x4b;
-    let first_op = |src: &str| compile(src)[0];
+    const NEW_BOX: u8 = 0x4e;
+    // skip boxes made for captured names (a recursive function captures its own name)
+    let first_op = |src: &str| {
+        let code = compile(src);
+        let mut i = 0;
+        while code[i] == NEW_BOX {
+            i += 2;
+        }
+        code[i]
+    };
 
     assert_eq!(first_op("function f() {} f();"), INTERNAL);
-    assert_eq!(first_op("function f(n) { return n ? f(n - 1) : 0; } f(3);"), INTERNAL);
+    assert_eq!(
+        first_op("function f(n) { return n ? f(n - 1) : 0; } f(3);"),
+        INTERNAL
+    );
     assert_eq!(first_op("function f() {} window.x = f;"), HOST_CALLABLE);
     assert_eq!(first_op("function f() {} [1].map(f);"), HOST_CALLABLE);
     assert_eq!(first_op("function f() {} let a = [f];"), HOST_CALLABLE);

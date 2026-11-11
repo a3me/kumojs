@@ -5,6 +5,7 @@
 // Both sides run in identical fresh sandboxes, so they see the same globals:
 // - default: browser-like, `window` is the sandbox global
 // - first line `// env: node`: no `window`, and Node's `process` is exposed
+// Each side's promise jobs finish before comparing; unhandled rejections are compared too.
 const fs = require('fs');
 const path = require('path');
 const nodeVm = require('vm');
@@ -30,18 +31,29 @@ function makeContext(logs) {
     return context;
 }
 
-function run(fn) {
+// Unhandled promise rejections, by error name, for the side that's running.
+let unhandled = [];
+process.on('unhandledRejection', (e) => unhandled.push((e && e.name) || String(e)));
+
+// Let promise jobs (and the rejection tracking after them) finish.
+const settle = () => new Promise((resolve) => setImmediate(() => setImmediate(resolve)));
+
+// Run one side and wait for its async work, so logs after an `await` count too.
+async function run(fn) {
     const logs = [];
     let error = null;
+    unhandled = [];
     try {
         fn(makeContext(logs));
     } catch (e) {
         error = { name: (e && e.name) || String(e), message: e && e.message };
     }
-    return { logs, error };
+    await settle();
+    return { logs, error, unhandled };
 }
 
-const kumo = run((context) => {
+(async () => {
+const kumo = await run((context) => {
     context.__kumoBytecode = Array.from(fs.readFileSync(bytecodePath));
     nodeVm.runInContext(
         vmSource +
@@ -53,12 +65,14 @@ const kumo = run((context) => {
 });
 
 // kumo parses input as a module, which is always strict mode
-const node = run((context) =>
+const node = await run((context) =>
     nodeVm.runInContext('"use strict";\n' + source, context, { timeout: TIMEOUT_MS })
 );
 
 const pass =
     JSON.stringify(kumo.logs) === JSON.stringify(node.logs) &&
-    (kumo.error && kumo.error.name) === (node.error && node.error.name);
+    (kumo.error && kumo.error.name) === (node.error && node.error.name) &&
+    JSON.stringify(kumo.unhandled) === JSON.stringify(node.unhandled);
 
 console.log(JSON.stringify({ pass, kumo, node }));
+})();

@@ -242,14 +242,14 @@ fn test_property_assignment() {
 #[test]
 fn test_unsupported_syntax_is_an_error_with_location() {
     let err = kumojs::Compiler::new()
-        .compile_source("input.js", "let x = [1];\nfor (let y of x) {}")
+        .compile_source("input.js", "let x = [1];\nexport { x };")
         .unwrap_err();
-    assert_eq!(err.to_string(), "unsupported for-of loop at input.js:2:1");
+    assert_eq!(err.to_string(), "unsupported import/export at input.js:2:1");
 
     let err = kumojs::Compiler::new()
-        .compile_source("input.js", "function f() {\n  return () => 1;\n}")
+        .compile_source("input.js", "function f() {\n  return import(\"x\");\n}")
         .unwrap_err();
-    assert_eq!(err.to_string(), "unsupported arrow function at input.js:2:10");
+    assert_eq!(err.to_string(), "unsupported dynamic import at input.js:2:10");
 }
 
 #[test]
@@ -265,7 +265,10 @@ fn test_undeclared_variables_are_compile_errors() {
     let compile = |src| kumojs::Compiler::new().compile_source("input.js", src);
 
     let err = compile("Math.max(1, 2)").unwrap_err();
-    assert_eq!(err.to_string(), "unsupported undeclared variable `Math` at input.js:1:1");
+    assert_eq!(
+        err.to_string(),
+        "unsupported undeclared variable `Math` at input.js:1:1"
+    );
 
     let err = compile("function f() {\n  x = 1;\n}").unwrap_err();
     assert_eq!(
@@ -274,11 +277,44 @@ fn test_undeclared_variables_are_compile_errors() {
     );
 
     let err = compile("window = 1").unwrap_err();
-    assert_eq!(err.to_string(), "unsupported assignment to `window` at input.js:1:1");
+    assert_eq!(
+        err.to_string(),
+        "unsupported assignment to `window` at input.js:1:1"
+    );
 
     // block-scoped names are gone after the block
     let err = compile("{ let inner = 1; }\ninner").unwrap_err();
-    assert_eq!(err.to_string(), "unsupported undeclared variable `inner` at input.js:2:1");
+    assert_eq!(
+        err.to_string(),
+        "unsupported undeclared variable `inner` at input.js:2:1"
+    );
 
     assert!(compile("typeof window; typeof globalThis; window.Math.max(1, 2)").is_ok());
+}
+
+#[test]
+fn test_private_name_errors() {
+    let compile = |src| kumojs::Compiler::new().compile_source("input.js", src);
+
+    let err = compile("class A {\n  m() { return this.#nope; }\n}").unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "unsupported undeclared private name `#nope` at input.js:2:21"
+    );
+
+    // private names are only visible inside their class body
+    let err = compile("class A { #x = 1; }\nclass B { m(o) { return #x in o; } }").unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "unsupported undeclared private name `#x` at input.js:2:25"
+    );
+
+    let err = compile("class A { #x = 1; #x() {} }").unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "unsupported duplicate private name `#x` at input.js:1:19"
+    );
+
+    // a getter and setter share a name
+    assert!(compile("class A { get #x() { return 1; } set #x(v) {} }").is_ok());
 }

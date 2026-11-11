@@ -24,3 +24,4 @@ Cargo.lock
 CLAUDE.md
 AGENTS.md
 docs/
+tests/**/*.txt

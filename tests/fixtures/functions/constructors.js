@@ -24,3 +24,20 @@ log(d.speak(), d instanceof Dog, d instanceof Animal);
 let date = new window.Date(0);
 log(date.getTime(), new window.Array(3).length, new Point(1, 1) instanceof window.Object);
 log(typeof new Point(0, 0), typeof Point);
+
+// constructors run directly by the VM: return values, prototypes, exceptions
+function RetObj() { this.a = 1; return { b: 2 }; }
+function RetPrim() { this.a = 1; return 5; }
+function RetNull() { this.a = 1; return null; }
+function RetFn() { return function () { return "fn"; }; }
+log(window.JSON.stringify(new RetObj()), window.JSON.stringify(new RetPrim()), window.JSON.stringify(new RetNull()), new RetFn()());
+function NoProto() { this.v = 1; }
+NoProto.prototype = 5;
+let np = new NoProto();
+log(window.Object.getPrototypeOf(np) === window.Object.prototype, np.v);
+function Throws() { throw new window.Error("ctor"); }
+try { new Throws(); } catch (e) { log("caught", e.message); }
+function Outer() { this.inner = new Inner(2); }
+function Inner(x) { this.x = x * 10; }
+let o = new Outer();
+log(o.inner.x, o instanceof Outer, o.inner instanceof Inner, o.constructor === Outer);
