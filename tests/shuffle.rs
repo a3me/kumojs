@@ -64,7 +64,11 @@ fn embedded_shuffled_vm_matches_node() {
         let native = node_run(&format!("\"use strict\";\n{src}"));
         for seed in [0u64, 3, 2024, u64::MAX] {
             let embedded = compile_embedded_source("p.js", src, seed).unwrap();
-            assert_eq!(native, node_run(&embedded), "seed {seed} output differs for {src:?}");
+            assert_eq!(
+                native,
+                node_run(&embedded),
+                "seed {seed} output differs for {src:?}"
+            );
         }
     }
 }

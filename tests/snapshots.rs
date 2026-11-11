@@ -35,7 +35,11 @@ fn bytecode_snapshots() {
     let mut files = Vec::new();
     js_files(&root, &mut files);
     files.sort();
-    assert!(!files.is_empty(), "no snapshot sources in {}", root.display());
+    assert!(
+        !files.is_empty(),
+        "no snapshot sources in {}",
+        root.display()
+    );
 
     let mut mismatched = Vec::new();
     for path in files {

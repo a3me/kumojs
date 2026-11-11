@@ -75,7 +75,10 @@ impl OpcodeMap {
         for (i, slot) in map.iter_mut().enumerate() {
             *slot = i as u8;
         }
-        OpcodeMap { to_byte: map, from_byte: map }
+        OpcodeMap {
+            to_byte: map,
+            from_byte: map,
+        }
     }
 
     /// A seeded permutation of the opcode bytes among themselves (non-opcode bytes
@@ -108,7 +111,10 @@ impl OpcodeMap {
     }
 
     pub fn is_identity(&self) -> bool {
-        self.to_byte.iter().enumerate().all(|(i, b)| *b as usize == i)
+        self.to_byte
+            .iter()
+            .enumerate()
+            .all(|(i, b)| *b as usize == i)
     }
 }
 
@@ -145,13 +151,17 @@ mod tests {
     fn seeded_map_is_a_bijection_that_inverts() {
         for seed in [0u64, 1, 42, 0xdead_beef, u64::MAX] {
             let map = OpcodeMap::from_seed(seed);
-            assert!(is_permutation(&map.to_byte), "seed {seed}: to_byte not a permutation");
+            assert!(
+                is_permutation(&map.to_byte),
+                "seed {seed}: to_byte not a permutation"
+            );
             for b in 0..=255u8 {
                 assert_eq!(map.from_byte[map.to_byte[b as usize] as usize], b);
             }
             // every real opcode is renumbered to another real opcode (so the VM switch,
             // which only has cases for real opcodes, still covers them)
-            let codes: std::collections::HashSet<u8> = crate::OPCODES.iter().map(|o| o.code).collect();
+            let codes: std::collections::HashSet<u8> =
+                crate::OPCODES.iter().map(|o| o.code).collect();
             for &c in &codes {
                 assert!(codes.contains(&map.to_byte[c as usize]));
             }
@@ -160,7 +170,13 @@ mod tests {
 
     #[test]
     fn seeded_map_is_deterministic() {
-        assert_eq!(OpcodeMap::from_seed(7).to_byte, OpcodeMap::from_seed(7).to_byte);
-        assert_ne!(OpcodeMap::from_seed(1).to_byte, OpcodeMap::from_seed(2).to_byte);
+        assert_eq!(
+            OpcodeMap::from_seed(7).to_byte,
+            OpcodeMap::from_seed(7).to_byte
+        );
+        assert_ne!(
+            OpcodeMap::from_seed(1).to_byte,
+            OpcodeMap::from_seed(2).to_byte
+        );
     }
 }

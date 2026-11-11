@@ -30,14 +30,27 @@ fn collect_fixtures(dir: &Path, out: &mut Vec<PathBuf>) {
 
 fn run_fixture(root: &Path, path: &Path) -> Result<(), Failed> {
     let source = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-    let name = path.strip_prefix(root).unwrap_or(path).display().to_string();
+    let name = path
+        .strip_prefix(root)
+        .unwrap_or(path)
+        .display()
+        .to_string();
     let compiled = Compiler::new().compile_source(&name, &source);
-    if let Some(expected) = source.lines().next().and_then(|l| l.strip_prefix("// compile-error:")) {
+    if let Some(expected) = source
+        .lines()
+        .next()
+        .and_then(|l| l.strip_prefix("// compile-error:"))
+    {
         let expected = expected.trim();
         return match compiled {
             Err(e) if e.to_string().contains(expected) => Ok(()),
-            Err(e) => Err(format!("expected compile error containing {expected:?}, got: {e}").into()),
-            Ok(_) => Err(format!("expected compile error containing {expected:?}, but it compiled").into()),
+            Err(e) => {
+                Err(format!("expected compile error containing {expected:?}, got: {e}").into())
+            }
+            Ok(_) => Err(format!(
+                "expected compile error containing {expected:?}, but it compiled"
+            )
+            .into()),
         };
     }
     let bytecode = compiled.map_err(|e| format!("compile failed: {e}"))?;

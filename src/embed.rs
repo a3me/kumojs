@@ -42,7 +42,11 @@ pub fn embed(map: &OpcodeMap, bytecode: &[u8]) -> String {
 }
 
 /// Compile `source` under `seed`'s numbering and embed it in a matching VM.
-pub fn compile_embedded_source(name: &str, source: &str, seed: u64) -> Result<String, CompileError> {
+pub fn compile_embedded_source(
+    name: &str,
+    source: &str,
+    seed: u64,
+) -> Result<String, CompileError> {
     let map = OpcodeMap::from_seed(seed);
     let bytecode = Compiler::new()
         .with_opcode_map(map.clone())
@@ -52,8 +56,8 @@ pub fn compile_embedded_source(name: &str, source: &str, seed: u64) -> Result<St
 
 /// Compile the file at `path` under `seed`'s numbering and embed it in a matching VM.
 pub fn compile_embedded_file(path: &Path, seed: u64) -> Result<String, CompileError> {
-    let source = std::fs::read_to_string(path)
-        .map_err(|e| CompileError::LoadFileError(e.to_string()))?;
+    let source =
+        std::fs::read_to_string(path).map_err(|e| CompileError::LoadFileError(e.to_string()))?;
     let name = path.to_string_lossy();
     compile_embedded_source(&name, &source, seed)
 }
@@ -97,8 +101,14 @@ mod tests {
         let opcodes: HashSet<u8> = crate::OPCODES.iter().map(|o| o.code).collect();
         let missing_case: Vec<_> = opcodes.difference(&cases).collect();
         let unknown_case: Vec<_> = cases.difference(&opcodes).collect();
-        assert!(missing_case.is_empty(), "opcodes with no vm.js case: {missing_case:02x?}");
-        assert!(unknown_case.is_empty(), "vm.js cases with no opcode: {unknown_case:02x?}");
+        assert!(
+            missing_case.is_empty(),
+            "opcodes with no vm.js case: {missing_case:02x?}"
+        );
+        assert!(
+            unknown_case.is_empty(),
+            "vm.js cases with no opcode: {unknown_case:02x?}"
+        );
     }
 
     #[test]

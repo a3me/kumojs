@@ -124,7 +124,8 @@ fn batch(list: &Path, out: &Path) -> ExitCode {
                 let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let Some(input) = inputs.get(i) else { break };
                 // a parser panic counts as a compile error for that file
-                let result = std::panic::catch_unwind(|| Compiler::new().compile_file(Path::new(input)));
+                let result =
+                    std::panic::catch_unwind(|| Compiler::new().compile_file(Path::new(input)));
                 let _ = match result {
                     Ok(Ok(bytecode)) => std::fs::write(out.join(format!("{i}.kumo")), bytecode),
                     Ok(Err(e)) => std::fs::write(out.join(format!("{i}.err")), e.to_string()),

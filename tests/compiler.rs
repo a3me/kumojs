@@ -49,7 +49,10 @@ fn unsupported_syntax_is_an_error_with_location() {
     let err = Compiler::new()
         .compile_source("input.js", "function f() {\n  return import(\"x\");\n}")
         .unwrap_err();
-    assert_eq!(err.to_string(), "unsupported dynamic import at input.js:2:10");
+    assert_eq!(
+        err.to_string(),
+        "unsupported dynamic import at input.js:2:10"
+    );
 }
 
 #[test]

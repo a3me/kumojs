@@ -2,7 +2,7 @@
 //! bytecode snapshot tests. Each line is `offset  Name operands`; jump targets are shown as
 //! absolute offsets in the same function, and nested functions are listed after a header.
 
-use crate::opcode::{Operand::*, OpcodeMap};
+use crate::opcode::{OpcodeMap, Operand::*};
 use crate::OPCODES;
 use std::fmt::Write;
 
@@ -51,12 +51,20 @@ pub fn disassemble_with(code: &[u8], map: &OpcodeMap) -> Result<String, String> 
     let mut out = String::new();
     listing(code, 0, map, &mut out)?;
     // no trailing spaces (operand-less instructions)
-    Ok(out.lines().map(str::trim_end).collect::<Vec<_>>().join("\n") + "\n")
+    Ok(out
+        .lines()
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n")
 }
 
 fn listing(code: &[u8], depth: usize, map: &OpcodeMap, out: &mut String) -> Result<(), String> {
     let indent = "    ".repeat(depth);
-    let mut r = Reader { bytes: code, pos: 0 };
+    let mut r = Reader {
+        bytes: code,
+        pos: 0,
+    };
     while r.pos < code.len() {
         let at = r.pos;
         // read the raw byte, then undo any renumbering to get the canonical opcode
@@ -69,7 +77,13 @@ fn listing(code: &[u8], depth: usize, map: &OpcodeMap, out: &mut String) -> Resu
                 let flags = r.u8()?;
                 let name = r.string()?;
                 let captures = (0..r.u8()?)
-                    .map(|_| Ok(format!("{}{}", if r.u8()? == 1 { "L" } else { "U" }, r.u8()?)))
+                    .map(|_| {
+                        Ok(format!(
+                            "{}{}",
+                            if r.u8()? == 1 { "L" } else { "U" },
+                            r.u8()?
+                        ))
+                    })
                     .collect::<Result<Vec<_>, String>>()?;
                 let len = r.u32()? as usize;
                 let body = r.take(len)?;
@@ -96,7 +110,11 @@ fn listing(code: &[u8], depth: usize, map: &OpcodeMap, out: &mut String) -> Resu
                 let count = r.u32()?;
                 let mut pieces = Vec::new();
                 for _ in 0..count {
-                    let cooked = if r.u8()? == 1 { Some(r.string()?) } else { None };
+                    let cooked = if r.u8()? == 1 {
+                        Some(r.string()?)
+                    } else {
+                        None
+                    };
                     let raw = r.string()?;
                     pieces.push(format!("{cooked:?}/{raw:?}"));
                 }
