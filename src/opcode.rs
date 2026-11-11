@@ -21,8 +21,6 @@ pub enum Operand {
     Jump,
     /// u32 backward offset (`Loop`): the target is this operand's end minus it
     Back,
-    /// u32 forward offset from the end of the whole instruction
-    JumpFromEnd,
 }
 
 /// An opcode's canonical byte, name and operand layout.

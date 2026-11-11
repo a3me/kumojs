@@ -93,9 +93,6 @@ fn listing(code: &[u8], depth: usize, map: &OpcodeMap, out: &mut String) -> Resu
                     .unwrap_or("?");
                 let mut extra = String::new();
                 if flags & 8 != 0 {
-                    extra.push_str(" generator");
-                }
-                if flags & 16 != 0 {
                     extra.push_str(" async");
                 }
                 let wrapped = if opcode == 0x4b { " internal" } else { "" };
@@ -126,9 +123,7 @@ fn listing(code: &[u8], depth: usize, map: &OpcodeMap, out: &mut String) -> Resu
                     .find(|o| o.code == opcode)
                     .ok_or_else(|| format!("unknown opcode 0x{opcode:02x} at {at:04x}"))?;
                 let name = info.name;
-                // offsets from the instruction's end are resolved once it's all read
                 let mut parts = Vec::new();
-                let mut from_end = Vec::new();
                 for operand in info.operands {
                     let part = match operand {
                         U8 => r.u8()?.to_string(),
@@ -144,15 +139,8 @@ fn listing(code: &[u8], depth: usize, map: &OpcodeMap, out: &mut String) -> Resu
                             let offset = r.u32()? as usize;
                             format!("-> {:04x}", r.pos.saturating_sub(offset))
                         }
-                        JumpFromEnd => {
-                            from_end.push((parts.len(), r.u32()? as usize));
-                            String::new()
-                        }
                     };
                     parts.push(part);
-                }
-                for (i, offset) in from_end {
-                    parts[i] = format!("-> {:04x}", r.pos + offset);
                 }
                 let _ = writeln!(out, "{name} {}", parts.join(" ").trim_end());
             }

@@ -52,32 +52,6 @@ impl<'a> Compiler<'a> {
                 self.bytecode.extend_from_slice(&index.to_le_bytes());
                 self.bytecode.push(name_it);
             }
-            Operation::Yield(raw) => {
-                self.bytecode.push(raw);
-                self.bytecode.extend_from_slice(&[0; 12]);
-            }
-            Operation::DelegateCall(iterator, mode, offset) => {
-                self.bytecode.push(iterator);
-                self.bytecode.push(mode);
-                self.bytecode.extend_from_slice(&offset.to_le_bytes());
-            }
-            Operation::DelegateResult(mode, is_async) => {
-                self.bytecode.push(mode);
-                self.bytecode.push(is_async);
-                self.bytecode.extend_from_slice(&[0; 8]);
-            }
-            Operation::AsyncIterNext(slot) | Operation::IterCloseCheck(slot) => {
-                self.bytecode.push(slot)
-            }
-            Operation::IterResult(slot, offset) => {
-                self.bytecode.push(slot);
-                self.bytecode.extend_from_slice(&offset.to_le_bytes());
-            }
-            Operation::AsyncIterClose(slot, mode, offset) => {
-                self.bytecode.push(slot);
-                self.bytecode.push(mode);
-                self.bytecode.extend_from_slice(&offset.to_le_bytes());
-            }
             Operation::LoadFloat64(n) => {
                 let bytes = n.to_le_bytes();
                 self.bytecode.extend_from_slice(&bytes);
@@ -101,7 +75,7 @@ impl<'a> Compiler<'a> {
                 length,
                 params,
                 kind,
-                coroutine,
+                is_async,
                 name,
                 captures,
                 code,
@@ -109,12 +83,8 @@ impl<'a> Compiler<'a> {
             }) => {
                 self.bytecode.push(length);
                 self.bytecode.push(params);
-                // kind, | 8 generator, | 16 async
-                self.bytecode.push(
-                    kind as u8
-                        | (coroutine.is_generator() as u8) << 3
-                        | (coroutine.is_async() as u8) << 4,
-                );
+                // kind, | 8 async
+                self.bytecode.push(kind as u8 | (is_async as u8) << 3);
                 self.emit_string(name.as_bytes());
                 // captures: count, then (from_local, index) pairs
                 self.bytecode.push(captures.len() as u8);

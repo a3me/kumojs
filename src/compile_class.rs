@@ -82,7 +82,7 @@ impl<'a> Compiler<'a> {
                     Some(body) => FnBody::Block(&body.stmts),
                     None => FnBody::Block(&[]),
                 };
-                self.compile_closure(name, None, &params, &body, false, kind, Coroutine::None)?;
+                self.compile_closure(name, None, &params, &body, false, kind, false)?;
             }
             // `constructor(...args) { super(...args); }` for derived classes
             None if derived => self.compile_closure(
@@ -92,7 +92,7 @@ impl<'a> Compiler<'a> {
                 &FnBody::DefaultDerived,
                 false,
                 kind,
-                Coroutine::None,
+                false,
             )?,
             None => self.compile_closure(
                 name,
@@ -101,7 +101,7 @@ impl<'a> Compiler<'a> {
                 &FnBody::Block(&[]),
                 false,
                 kind,
-                Coroutine::None,
+                false,
             )?,
         }
         self.emit_op(Operation::MakeClass(derived as u8));
@@ -202,7 +202,7 @@ impl<'a> Compiler<'a> {
                 &body,
                 true,
                 FnKind::Method,
-                Coroutine::None,
+                false,
             )?;
             self.emit_op(Operation::ClassInit);
         }
@@ -237,7 +237,7 @@ impl<'a> Compiler<'a> {
                         &body,
                         true,
                         FnKind::Method,
-                        Coroutine::None,
+                        false,
                     )?;
                     self.emit_op(Operation::StaticBlock);
                 }
@@ -272,7 +272,7 @@ impl<'a> Compiler<'a> {
                     &body,
                     true,
                     FnKind::Method,
-                    Coroutine::None,
+                    false,
                 )
             }
             None => {

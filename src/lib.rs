@@ -35,7 +35,7 @@ pub(crate) use swc_ecma_ast::{
     OptChainExpr,
     ParamOrTsParamProp, Pat, PrivateName, PrivateProp, Prop, PropName, PropOrSpread,
     SimpleAssignTarget, StaticBlock, Stmt,
-    SuperProp, SwitchStmt, TaggedTpl, Tpl, TryStmt, UnaryExpr, UnaryOp, UpdateExpr, UpdateOp, YieldExpr,
+    SuperProp, SwitchStmt, TaggedTpl, Tpl, TryStmt, UnaryExpr, UnaryOp, UpdateExpr, UpdateOp,
     VarDecl, VarDeclKind, VarDeclOrExpr, VarDeclarator, WhileStmt,
 };
 pub(crate) use swc_ecma_visit::{Visit, VisitWith};
@@ -70,8 +70,8 @@ pub struct Compiler<'a> {
     upvalues: RefCell<Vec<(bool, u8)>>,
     /// compiling an arrow function: `this` and `arguments` come from the enclosing function
     is_arrow: bool,
-    /// compiling a generator / async function (`yield` / `await` suspend it)
-    coroutine: Coroutine,
+    /// compiling an async function (`await` suspends it)
+    is_async: bool,
     /// where this function's closure is made in the enclosing function's source (0 for
     /// hoisted function declarations: they exist from the start of their scope)
     created_at: BytePos,
@@ -86,32 +86,6 @@ pub struct Compiler<'a> {
     /// how emitted opcode bytes are renumbered (identity unless a seed shuffles them);
     /// shared by every nested function so one script's bytecode is internally consistent
     opcode_map: Lrc<opcode::OpcodeMap>,
-}
-
-/// Whether a function can suspend: generators (`yield`), async functions (`await`) or both.
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum Coroutine {
-    None,
-    Generator,
-    Async,
-    AsyncGenerator,
-}
-
-impl Coroutine {
-    pub(crate) fn of(is_generator: bool, is_async: bool) -> Self {
-        match (is_generator, is_async) {
-            (false, false) => Coroutine::None,
-            (true, false) => Coroutine::Generator,
-            (false, true) => Coroutine::Async,
-            (true, true) => Coroutine::AsyncGenerator,
-        }
-    }
-    pub(crate) fn is_generator(self) -> bool {
-        matches!(self, Coroutine::Generator | Coroutine::AsyncGenerator)
-    }
-    pub(crate) fn is_async(self) -> bool {
-        matches!(self, Coroutine::Async | Coroutine::AsyncGenerator)
-    }
 }
 
 #[derive(Error, Debug)]
@@ -238,8 +212,8 @@ struct Breakable {
 struct TryRegion {
     finally: Option<BlockStmt>,
     /// a `for-of` body instead: the slot of the iterator to close (`return()`) on early
-    /// exit, and whether it's a `for await` (closing awaits)
-    close_iterator: Option<(u8, bool)>,
+    /// exit
+    close_iterator: Option<u8>,
     /// scope at the `try` statement, so the inlined `finally` resolves names correctly
     locals_len: usize,
     scope_depth: usize,
@@ -478,35 +452,9 @@ enum Operation {
     Decrement,
     /// Jump forward by offset if top of stack is null/undefined (does not pop)
     JumpIfNullish(u32),
-    /// A generator's start (after its parameters): suspend, giving the caller the
-    /// generator object
-    InitialYield,
-    /// [value] -> suspend, giving the caller `{ value, done: false }` (or the value itself
-    /// when raw = 1). Three u32 offsets from the end of the instruction say where to resume
-    /// for `next(v)`, `throw(e)` and `return(v)`; the sent value is pushed.
-    Yield(u8),
     /// [value] -> suspend until the value settles, then push the result. A rejection
     /// resumes at the instruction after (a `Throw`), a fulfilment after that.
     Await,
-    /// [iterable] -> [async iterator record] (`for await`, async `yield*`)
-    GetAsyncIterator,
-    /// `yield*`: [received] -> [inner result]: call the iterator record's next / throw /
-    /// return (by the mode slot) with it. Without a `return` method a return jumps
-    /// forward with the received value.
-    DelegateCall(u8, u8, u32),
-    /// `yield*`: [inner result] -> [result to yield] (async: its value); when done, its
-    /// value jumps to the first offset (or the second, for a return)
-    DelegateResult(u8, u8),
-    /// `for await`: [iterator record slot] -> [promise of the next result]
-    AsyncIterNext(u8),
-    /// [result] -> [value], or jump forward by the offset when it's done (marking the
-    /// record in the slot done)
-    IterResult(u8, u32),
-    /// `for await` closing: call the record's `return()` and push its result, or jump
-    /// forward when there's nothing to await; mode 1 (leaving by a throw) ignores errors
-    AsyncIterClose(u8, u8, u32),
-    /// [awaited return() result] -> []: must be an object (mode 0)
-    IterCloseCheck(u8),
     /// [key] -> [property key]: a string or symbol, converted the way JS does
     ToPropertyKey,
     /// Put a fresh box holding the "uninitialised" value in a slot (see `Tdz`)
@@ -556,7 +504,7 @@ struct FnInfo {
     /// parameter slots filled from the call's arguments
     params: u8,
     kind: FnKind,
-    coroutine: Coroutine,
+    is_async: bool,
     internal: bool,
     name: String,
     /// `(from_local, index)` pairs, see `Compiler::upvalues`
@@ -710,16 +658,7 @@ opcode::opcodes! {
     IterNext(..)              => 0x72, [U8, Jump];
     IterClose(..)             => 0x73, [U8, U8];
     JumpIfNullish(..)         => 0x74, [Jump];
-    InitialYield              => 0x75, [];
-    Yield(..)                 => 0x76, [U8, JumpFromEnd, JumpFromEnd, JumpFromEnd];
     Await                     => 0x77, [];
-    GetAsyncIterator          => 0x78, [];
-    DelegateCall(..)          => 0x79, [U8, U8, Jump];
-    DelegateResult(..)        => 0x7a, [U8, U8, JumpFromEnd, JumpFromEnd];
-    AsyncIterNext(..)         => 0x7b, [U8];
-    IterResult(..)            => 0x7c, [U8, Jump];
-    AsyncIterClose(..)        => 0x7d, [U8, U8, Jump];
-    IterCloseCheck(..)        => 0x7e, [U8];
     ToPropertyKey             => 0x7f, [];
     InitInstance              => 0x80, [];
     SuperCallFinish           => 0x81, [];
@@ -748,7 +687,7 @@ impl<'a> Compiler<'a> {
             captured_names: HashSet::new(),
             upvalues: RefCell::new(Vec::new()),
             is_arrow: false,
-            coroutine: Coroutine::None,
+            is_async: false,
             created_at: BytePos(0),
             next_anchor: None,
             in_switch: false,

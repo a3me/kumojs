@@ -220,13 +220,7 @@ impl<'a> Compiler<'a> {
             }
             Stmt::Return(return_stmt) => {
                 match &return_stmt.arg {
-                    Some(arg) => {
-                        self.compile_expr(arg)?;
-                        // an async generator's `return x` awaits x
-                        if self.coroutine == Coroutine::AsyncGenerator {
-                            self.emit_await();
-                        }
-                    }
+                    Some(arg) => self.compile_expr(arg)?,
                     None => self.emit_op(Operation::Undefined),
                 }
                 self.emit_unwind_tries(0)?;
@@ -476,9 +470,8 @@ impl<'a> Compiler<'a> {
     ///   GetIterator -> it; L: IterNext(it, X) TryStart(H) bind body C: TryEnd Loop L;
     ///   H: IterClose(it, throw) rethrow; X:
     pub(crate) fn compile_for_of(&mut self, stmt: &ForOfStmt) -> CompileResult {
-        let is_await = stmt.is_await;
-        if is_await && !self.coroutine.is_async() {
-            return unsupported("top-level for await", stmt.span);
+        if stmt.is_await {
+            return unsupported("for await", stmt.span);
         }
         self.enter_scope();
         // the iterator lives in a hidden slot, so break/continue leave nothing on the stack
@@ -486,28 +479,17 @@ impl<'a> Compiler<'a> {
         // the iterable is evaluated with the head's names declared (but not initialised)
         let target = self.loop_head_target(&stmt.left, &stmt.right)?;
         self.compile_expr(&stmt.right)?;
-        self.emit_op(if is_await {
-            Operation::GetAsyncIterator
-        } else {
-            Operation::GetIterator
-        });
+        self.emit_op(Operation::GetIterator);
         self.emit_op(Operation::SetLocal(iterator));
         self.emit_op(Operation::Pop);
 
         self.push_breakable(BreakableKind::Loop);
         self.breakables.last_mut().unwrap().iter_region = true;
         let start = self.bytecode.len();
-        let exit = if is_await {
-            // await the next result, then take its value
-            self.emit_op(Operation::AsyncIterNext(iterator));
-            self.emit_await();
-            self.emit_jump(Operation::IterResult(iterator, 0))
-        } else {
-            self.emit_jump(Operation::IterNext(iterator, 0))
-        };
+        let exit = self.emit_jump(Operation::IterNext(iterator, 0));
         let handler = self.emit_jump(Operation::TryStart(0));
         self.push_try_region(None);
-        self.try_stack.last_mut().unwrap().close_iterator = Some((iterator, is_await));
+        self.try_stack.last_mut().unwrap().close_iterator = Some(iterator);
         self.bind_loop_head(&stmt.left, target)?;
         self.compile_stmt(&stmt.body, false)?;
         self.patch_continues();
@@ -520,7 +502,7 @@ impl<'a> Compiler<'a> {
         let temp = self.temp()?;
         self.emit_op(Operation::SetLocal(temp));
         self.emit_op(Operation::Pop);
-        self.emit_iter_close(iterator, is_await, 1);
+        self.emit_op(Operation::IterClose(iterator, 1));
         self.emit_op(Operation::GetLocal(temp));
         self.emit_op(Operation::Throw);
 
@@ -528,19 +510,6 @@ impl<'a> Compiler<'a> {
         self.pop_breakable();
         self.exit_scope();
         Ok(())
-    }
-
-    /// Close the iterator record in a slot; mode 1 (leaving by a throw) ignores errors.
-    /// An async iterator's `return()` result is awaited.
-    pub(crate) fn emit_iter_close(&mut self, iterator: u8, is_async: bool, mode: u8) {
-        if !is_async {
-            self.emit_op(Operation::IterClose(iterator, mode));
-            return;
-        }
-        let skip = self.emit_jump(Operation::AsyncIterClose(iterator, mode, 0));
-        self.emit_await();
-        self.emit_op(Operation::IterCloseCheck(mode));
-        self.patch_jump(skip);
     }
 
     pub(crate) fn compile_labeled(&mut self, stmt: &LabeledStmt) -> CompileResult {
@@ -709,8 +678,8 @@ impl<'a> Compiler<'a> {
         while i > depth {
             i -= 1;
             self.emit_op(Operation::TryEnd);
-            if let Some((iterator, is_async)) = self.try_stack[i].close_iterator {
-                self.emit_iter_close(iterator, is_async, 0);
+            if let Some(iterator) = self.try_stack[i].close_iterator {
+                self.emit_op(Operation::IterClose(iterator, 0));
             }
             let Some(finally) = self.try_stack[i].finally.clone() else {
                 continue;

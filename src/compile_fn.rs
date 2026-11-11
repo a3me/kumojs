@@ -46,12 +46,15 @@ impl<'a> Compiler<'a> {
             Some(body) => FnBody::Block(&body.stmts),
             None => FnBody::Block(&[]),
         };
-        let coroutine = Coroutine::of(function.is_generator, function.is_async);
+        if function.is_generator {
+            return unsupported("generator", function.span);
+        }
+        let is_async = function.is_async;
         // a function value exists from here (declarations are hoisted: they set no anchor)
         if !self.hoisting_fn {
             self.next_anchor = Some(function.span.lo);
         }
-        self.compile_closure(name, self_name, &params, &body, internal, kind, coroutine)
+        self.compile_closure(name, self_name, &params, &body, internal, kind, is_async)
     }
 
     pub(crate) fn compile_arrow(
@@ -65,7 +68,7 @@ impl<'a> Compiler<'a> {
             ArrowFunctionBody::FunctionBody(block) => FnBody::Block(&block.stmts),
             ArrowFunctionBody::Expr(expr) => FnBody::Expr(expr),
         };
-        let coroutine = Coroutine::of(arrow.is_generator, arrow.is_async);
+        let is_async = arrow.is_async;
         self.next_anchor = Some(arrow.span.lo);
         self.compile_closure(
             name,
@@ -74,7 +77,7 @@ impl<'a> Compiler<'a> {
             &body,
             internal,
             FnKind::Arrow,
-            coroutine,
+            is_async,
         )
     }
 
@@ -88,7 +91,7 @@ impl<'a> Compiler<'a> {
         body: &FnBody,
         internal: bool,
         kind: FnKind,
-        coroutine: Coroutine,
+        is_async: bool,
     ) -> CompileResult {
         let created_at = self
             .next_anchor
@@ -97,7 +100,7 @@ impl<'a> Compiler<'a> {
             .unwrap_or(BytePos(0));
         let mut c = Compiler::new_enclosing(self);
         c.is_arrow = kind == FnKind::Arrow;
-        c.coroutine = coroutine;
+        c.is_async = is_async;
         c.created_at = created_at;
         let body_stmts: Vec<&Stmt> = match body {
             FnBody::Block(stmts) => stmts.iter().collect(),
@@ -184,13 +187,6 @@ impl<'a> Compiler<'a> {
             }
         }
 
-        // a generator stops here (parameters are set up when it's called) and hands back
-        // its generator object; the first `next()` resumes it (its value is unused)
-        if coroutine.is_generator() {
-            c.emit_op(Operation::InitialYield);
-            c.emit_op(Operation::Pop);
-        }
-
         match body {
             FnBody::Block(_) => {
                 c.compile_body(&body_stmts, true, false)?;
@@ -199,9 +195,6 @@ impl<'a> Compiler<'a> {
             }
             FnBody::Expr(expr) => {
                 c.compile_expr(expr)?;
-                if coroutine == Coroutine::AsyncGenerator {
-                    c.emit_await();
-                }
             }
             FnBody::Field(expr, Some(name)) => c.compile_expr_named(expr, name)?,
             FnBody::Field(expr, None) => c.compile_expr(expr)?,
@@ -240,7 +233,7 @@ impl<'a> Compiler<'a> {
             length: length.unwrap_or(params.len()) as u8,
             params: param_count,
             kind,
-            coroutine,
+            is_async,
             internal,
             name,
             captures,

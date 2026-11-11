@@ -88,14 +88,6 @@ for (let i = 0; i < 2; i++) {
 }
 log(loopResults.join(","));
 
-// generators and async functions keep checks across suspension
-function* gen() {
-    yield errName(() => later);
-    let later = "set";
-    yield later;
-}
-log([...gen()].join(","));
-
 // after initialisation everything is normal, including recursion through the binding
 const fact = (n) => (n <= 1 ? 1 : n * fact(n - 1));
 let counter = 0;

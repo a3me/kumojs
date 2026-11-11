@@ -1,4 +1,4 @@
-//! Compiling expressions (incl. generators/async, optional chaining, templates).
+//! Compiling expressions (incl. async, optional chaining, templates).
 
 use crate::*;
 
@@ -124,9 +124,8 @@ impl<'a> Compiler<'a> {
                 self.emit_op(Operation::NewTarget)
             }
             Expr::TaggedTpl(tagged) => self.compile_tagged_tpl(tagged)?,
-            Expr::Yield(yield_expr) => self.compile_yield(yield_expr)?,
             Expr::Await(await_expr) => {
-                if !self.coroutine.is_async() {
+                if !self.is_async {
                     return unsupported("top-level await", await_expr.span);
                 }
                 self.compile_expr(&await_expr.arg)?;
@@ -143,7 +142,7 @@ impl<'a> Compiler<'a> {
     }
 
     // ---------------------------------------------------------------------------------
-    // generators and async functions
+    // async functions
     // ---------------------------------------------------------------------------------
 
     /// [value] -> [result]: suspend until the awaited value settles. A rejection resumes
@@ -151,106 +150,6 @@ impl<'a> Compiler<'a> {
     pub(crate) fn emit_await(&mut self) {
         self.emit_op(Operation::Await);
         self.emit_op(Operation::Throw);
-    }
-
-    /// Emit `Yield` for the value on top of the stack. `raw` yields it as the iterator
-    /// result itself (`yield*` passing on its inner results). Resuming continues after it
-    /// with the value sent in by `next(v)`; `throw(e)` throws e here and `return(v)`
-    /// returns v from here (running `finally` blocks and closing `for-of` iterators).
-    pub(crate) fn emit_yield(&mut self, raw: bool) -> CompileResult {
-        let [normal, throw, ret] = self.emit_multi_jump(Operation::Yield(raw as u8));
-        self.patch_from_end(throw);
-        self.emit_op(Operation::Throw);
-        self.patch_from_end(ret);
-        self.emit_generator_return()?;
-        self.patch_from_end(normal);
-        Ok(())
-    }
-
-    /// Emit an instruction ending in N u32 forward offsets, each counted from the end of
-    /// the instruction. Returns (instruction end, operand position) pairs to patch.
-    pub(crate) fn emit_multi_jump<const N: usize>(&mut self, op: Operation) -> [(usize, usize); N] {
-        self.emit_op(op);
-        let end = self.bytecode.len();
-        std::array::from_fn(|i| (end, end - 4 * (N - i)))
-    }
-
-    /// Point an offset from `emit_multi_jump` at the current end of the bytecode.
-    pub(crate) fn patch_from_end(&mut self, (end, pos): (usize, usize)) {
-        let offset = (self.bytecode.len() - end) as u32;
-        self.bytecode[pos..pos + 4].copy_from_slice(&offset.to_le_bytes());
-    }
-
-    /// [value] -> return it from the generator (an async generator awaits it first).
-    pub(crate) fn emit_generator_return(&mut self) -> CompileResult {
-        if self.coroutine == Coroutine::AsyncGenerator {
-            self.emit_await();
-        }
-        self.emit_unwind_tries(0)?;
-        self.emit_op(Operation::Return);
-        Ok(())
-    }
-
-    pub(crate) fn compile_yield(&mut self, expr: &YieldExpr) -> CompileResult {
-        if !expr.delegate {
-            match &expr.arg {
-                Some(arg) => self.compile_expr(arg)?,
-                None => self.emit_op(Operation::Undefined),
-            }
-            // an async generator awaits what it yields
-            if self.coroutine == Coroutine::AsyncGenerator {
-                self.emit_await();
-            }
-            return self.emit_yield(false);
-        }
-
-        // `yield* inner`: pass each next / throw / return on to inner's iterator, yielding
-        // its results, until it's done (its final value is the result)
-        let is_async = self.coroutine.is_async();
-        let iterator = self.alloc_slot()?;
-        let mode = self.alloc_slot()?;
-        let arg = expr.arg.as_deref().expect("yield* always has an argument");
-        self.compile_expr(arg)?;
-        self.emit_op(if is_async {
-            Operation::GetAsyncIterator
-        } else {
-            Operation::GetIterator
-        });
-        self.emit_op(Operation::SetLocal(iterator));
-        self.emit_op(Operation::Pop);
-        self.emit_set_mode(mode, 0);
-        // the first value passed on is `undefined`
-        self.emit_op(Operation::Undefined);
-
-        let start = self.bytecode.len();
-        // [received] -> [inner result]
-        let no_return = self.emit_jump(Operation::DelegateCall(iterator, mode, 0));
-        if is_async {
-            self.emit_await();
-        }
-        // done: [value] -> the result, or the generator's return value (mode 2)
-        let [done, ret] = self.emit_multi_jump(Operation::DelegateResult(mode, is_async as u8));
-        let [normal, throw, resumed_return] =
-            self.emit_multi_jump(Operation::Yield(!is_async as u8));
-        for (resume, m) in [(throw, 1), (resumed_return, 2), (normal, 0)] {
-            self.patch_from_end(resume);
-            self.emit_set_mode(mode, m);
-            self.emit_loop(start);
-        }
-
-        // inner is done with a `return(v)`, or has no `return`: return v from here
-        self.patch_jump(no_return);
-        self.patch_from_end(ret);
-        self.emit_generator_return()?;
-        self.patch_from_end(done);
-        Ok(())
-    }
-
-    /// Store a `yield*` resume mode (0 next, 1 throw, 2 return) in its slot.
-    pub(crate) fn emit_set_mode(&mut self, slot: u8, mode: u8) {
-        self.emit_op(Operation::LoadFloat64(mode as f64));
-        self.emit_op(Operation::SetLocal(slot));
-        self.emit_op(Operation::Pop);
     }
 
     // ---------------------------------------------------------------------------------
