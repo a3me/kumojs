@@ -6,6 +6,10 @@ things to note:
 
 - input is parsed in strict mode (as a module), so features like `with` are not supported.
 
+- generators (`function*`, `yield`) and `for await` are not supported, but `async` / `await` is.
+
+- no `import` / `export`, dynamic `import()`, top-level `await`, `using` declarations or JSX.
+
 - variables must be declared before use to avoid ambiguity between virtual and host propeties, this has impacts in behaviour between real javascript environments and kumojs' interpreter, beware! 
 
     e.g.
