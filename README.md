@@ -47,6 +47,16 @@ compile a script into bytecode
 cargo run --release --bin kumoc -- in.js out.kumo
 ```
 
+bundle a script with the VM into one standalone file (opcodes shuffled unless `--seed N` / `--canonical`)
+```sh
+node tools/build.mjs bundle in.js --out out.js
+```
+
+regenerate the VM's opcode declarations after changing the opcode table in `src/opcode.rs`
+```sh
+cargo run --bin kumoc -- --emit-opcodes src/vm/opcodes.d.ts
+```
+
 run benchmarks
 ```sh
 node bench/run.js [filter]

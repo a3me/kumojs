@@ -10,5 +10,5 @@
     "skipLibCheck": true,
     "types": []
   },
-  "include": ["src/vm/vm.ts"]
+  "include": ["src/vm/vm.ts", "src/vm/opcodes.d.ts"]
 }

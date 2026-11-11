@@ -2,8 +2,7 @@
 //! bytecode snapshot tests. Each line is `offset  Name operands`; jump targets are shown as
 //! absolute offsets in the same function, and nested functions are listed after a header.
 
-use crate::opcode::{OpcodeMap, Operand::*};
-use crate::OPCODES;
+use crate::opcode::{op, FnKind, OpcodeMap, Operand::*, FN_ASYNC, FN_KIND_MASK, OPCODES};
 use std::fmt::Write;
 
 struct Reader<'b> {
@@ -71,7 +70,7 @@ fn listing(code: &[u8], depth: usize, map: &OpcodeMap, out: &mut String) -> Resu
         let opcode = map.from_byte[r.u8()? as usize];
         let _ = write!(out, "{indent}{at:04x}  ");
         match opcode {
-            0x37 | 0x4b => {
+            op::Function | op::InternalFunction => {
                 let length = r.u8()?;
                 let params = r.u8()?;
                 let flags = r.u8()?;
@@ -87,15 +86,9 @@ fn listing(code: &[u8], depth: usize, map: &OpcodeMap, out: &mut String) -> Resu
                     .collect::<Result<Vec<_>, String>>()?;
                 let len = r.u32()? as usize;
                 let body = r.take(len)?;
-                let kind = ["normal", "arrow", "method", "class", "derived class"]
-                    .get((flags & 7) as usize)
-                    .copied()
-                    .unwrap_or("?");
-                let mut extra = String::new();
-                if flags & 8 != 0 {
-                    extra.push_str(" async");
-                }
-                let wrapped = if opcode == 0x4b { " internal" } else { "" };
+                let kind = FnKind::label(flags & FN_KIND_MASK);
+                let extra = if flags & FN_ASYNC != 0 { " async" } else { "" };
+                let wrapped = if opcode == op::InternalFunction { " internal" } else { "" };
                 let _ = writeln!(
                     out,
                     "Function {name:?} ({kind}{extra}{wrapped}, length {length}, params {params}, captures [{}])",
@@ -103,7 +96,7 @@ fn listing(code: &[u8], depth: usize, map: &OpcodeMap, out: &mut String) -> Resu
                 );
                 listing(body, depth + 1, map, out)?;
             }
-            0x5a => {
+            op::TemplateObject => {
                 let count = r.u32()?;
                 let mut pieces = Vec::new();
                 for _ in 0..count {

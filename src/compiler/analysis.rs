@@ -1,34 +1,11 @@
-//! Static analysis: variable collection, escape and capture scans, small AST helpers.
+//! Static analysis over the AST: `var` collection, escape and capture scans, and small
+//! AST helpers.
 
-use crate::*;
-
-pub(crate) fn load_str(s: &str) -> Operation {
-    Operation::LoadString(s.as_bytes().to_vec())
-}
-
-pub(crate) fn stmt_kind(stmt: &Stmt) -> &'static str {
-    match stmt {
-        Stmt::With(_) => "with statement",
-        Stmt::Decl(Decl::Class(_)) => "class declaration",
-        Stmt::Decl(_) => "declaration",
-        _ => "statement",
-    }
-}
-
-pub(crate) fn expr_kind(expr: &Expr) -> &'static str {
-    match expr {
-        Expr::Arrow(_) => "arrow function",
-        Expr::Class(_) => "class expression",
-        Expr::Tpl(_) | Expr::TaggedTpl(_) => "template literal",
-        Expr::SuperProp(_) => "super property",
-        Expr::MetaProp(_) => "meta property",
-        _ => "expression",
-    }
-}
+use super::prelude::*;
 
 /// Collects `var` names declared anywhere in a function body, without entering nested functions.
-pub(crate) struct VarCollector<'n> {
-    pub(crate) names: &'n mut Vec<String>,
+pub(super) struct VarCollector<'n> {
+    pub(super) names: &'n mut Vec<String>,
 }
 
 impl Visit for VarCollector<'_> {
@@ -52,7 +29,7 @@ impl Visit for VarCollector<'_> {
 /// any other read (`g = f`, `arr.map(f)`, `window.x = f`, `typeof f`, `new f`, `{ f }`)
 /// lets the value leave VM control. Shadowed names in nested scopes are counted too, which
 /// can only make the answer more cautious.
-pub(crate) fn fn_escapes(name: &str, stmts: &[&Stmt]) -> bool {
+pub(super) fn fn_escapes(name: &str, stmts: &[&Stmt]) -> bool {
     let mut scan = EscapeScan {
         name,
         escapes: false,
@@ -63,7 +40,7 @@ pub(crate) fn fn_escapes(name: &str, stmts: &[&Stmt]) -> bool {
     scan.escapes
 }
 
-pub(crate) fn fn_escapes_in_function(name: &str, function: &Function) -> bool {
+pub(super) fn fn_escapes_in_function(name: &str, function: &Function) -> bool {
     let mut scan = EscapeScan {
         name,
         escapes: false,
@@ -72,18 +49,14 @@ pub(crate) fn fn_escapes_in_function(name: &str, function: &Function) -> bool {
     scan.escapes
 }
 
-pub(crate) struct EscapeScan<'n> {
+struct EscapeScan<'n> {
     name: &'n str,
     escapes: bool,
 }
 
 impl EscapeScan<'_> {
     fn is_name(&self, expr: &Expr) -> bool {
-        let mut expr = expr;
-        while let Expr::Paren(paren) = expr {
-            expr = &paren.expr;
-        }
-        matches!(expr, Expr::Ident(ident) if *ident.sym == *self.name)
+        matches!(expr.unwrap_parens(), Expr::Ident(ident) if *ident.sym == *self.name)
     }
 }
 
@@ -115,7 +88,7 @@ impl Visit for EscapeScan<'_> {
 /// A local with one of these names may be captured, so it's kept in a box. Matching by
 /// name alone ignores shadowing, which can only box more variables than needed.
 /// `params` count too: a default value can hold a closure.
-pub(crate) fn captured_names(params: &[&Pat], body: &FnBody, stmts: &[&Stmt]) -> HashSet<String> {
+pub(super) fn captured_names(params: &[&Pat], body: &FnBody, stmts: &[&Stmt]) -> HashSet<String> {
     let mut scan = CaptureScan {
         names: HashSet::new(),
         fn_depth: 0,
@@ -137,7 +110,7 @@ pub(crate) fn captured_names(params: &[&Pat], body: &FnBody, stmts: &[&Stmt]) ->
     scan.names
 }
 
-pub(crate) struct CaptureScan {
+struct CaptureScan {
     names: HashSet<String>,
     /// how many nested functions deep the visitor is
     fn_depth: usize,
@@ -190,13 +163,13 @@ impl Visit for CaptureScan {
 }
 
 /// The hidden local name for a private name: `#x` (can't clash with an identifier).
-pub(crate) fn private_key(name: &PrivateName) -> String {
+pub(super) fn private_key(name: &PrivateName) -> String {
     format!("#{}", name.name)
 }
 
 /// The private names a class body declares, in source order, with what each one is.
 /// A getter and setter pair share one name.
-pub(crate) fn class_private_names(class: &Class) -> CompileResult<Vec<(String, PrivateKind)>> {
+pub(super) fn class_private_names(class: &Class) -> CompileResult<Vec<(String, PrivateKind)>> {
     let mut names: Vec<(String, PrivateKind, bool)> = Vec::new();
     for member in &class.body {
         let (name, kind, is_static) = match member {
@@ -225,7 +198,7 @@ pub(crate) fn class_private_names(class: &Class) -> CompileResult<Vec<(String, P
 /// Whether private method `name` is used other than by calling it (`x.#m(...)`) in the
 /// class body. Private names can only be used inside the class body, so this is exact
 /// (an inner class reusing the name only makes it more cautious).
-pub(crate) fn private_method_escapes(name: &PrivateName, class: &Class) -> bool {
+pub(super) fn private_method_escapes(name: &PrivateName, class: &Class) -> bool {
     let mut scan = PrivateEscapeScan {
         name: &name.name,
         escapes: false,
@@ -234,7 +207,7 @@ pub(crate) fn private_method_escapes(name: &PrivateName, class: &Class) -> bool 
     scan.escapes
 }
 
-pub(crate) struct PrivateEscapeScan<'n> {
+struct PrivateEscapeScan<'n> {
     name: &'n str,
     escapes: bool,
 }
@@ -247,14 +220,10 @@ impl PrivateEscapeScan<'_> {
 
 impl Visit for PrivateEscapeScan<'_> {
     fn visit_call_expr(&mut self, n: &CallExpr) {
-        let mut callee = match &n.callee {
-            Callee::Expr(callee) => &**callee,
-            _ => return n.visit_children_with(self),
+        let Callee::Expr(callee) = &n.callee else {
+            return n.visit_children_with(self);
         };
-        while let Expr::Paren(paren) = callee {
-            callee = &paren.expr;
-        }
-        match callee {
+        match callee.unwrap_parens() {
             // a method call doesn't let the function out
             Expr::Member(member) if self.is_name(&member.prop) => {
                 member.obj.visit_with(self);
@@ -272,7 +241,7 @@ impl Visit for PrivateEscapeScan<'_> {
 }
 
 /// The names a binding pattern declares, in source order.
-pub(crate) fn pat_idents(pat: &Pat) -> Vec<&Ident> {
+pub(super) fn pat_idents(pat: &Pat) -> Vec<&Ident> {
     fn walk<'p>(pat: &'p Pat, out: &mut Vec<&'p Ident>) {
         match pat {
             Pat::Ident(ident) => out.push(&ident.id),
@@ -302,7 +271,7 @@ pub(crate) fn pat_idents(pat: &Pat) -> Vec<&Ident> {
 
 /// A property key known at compile time, as a function name (`None` for computed keys and
 /// numbers that need JS formatting).
-pub(crate) fn static_key_name(key: &PropName) -> Option<String> {
+pub(super) fn static_key_name(key: &PropName) -> Option<String> {
     match key {
         PropName::Ident(ident) => Some(ident.sym.to_string()),
         PropName::Str(s) => Some(String::from_utf8_lossy(s.value.as_bytes()).into_owned()),
@@ -314,7 +283,7 @@ pub(crate) fn static_key_name(key: &PropName) -> Option<String> {
 }
 
 /// A non-computed `__proto__` key.
-pub(crate) fn is_proto_key(key: &PropName) -> bool {
+pub(super) fn is_proto_key(key: &PropName) -> bool {
     match key {
         PropName::Ident(ident) => &*ident.sym == "__proto__",
         PropName::Str(s) => s.value.as_bytes() == b"__proto__",
@@ -323,12 +292,8 @@ pub(crate) fn is_proto_key(key: &PropName) -> bool {
 }
 
 /// An unnamed function or arrow expression, which takes its name from where it's stored.
-pub(crate) fn is_anonymous_fn(expr: &Expr) -> bool {
-    let mut expr = expr;
-    while let Expr::Paren(paren) = expr {
-        expr = &paren.expr;
-    }
-    match expr {
+pub(super) fn is_anonymous_fn(expr: &Expr) -> bool {
+    match expr.unwrap_parens() {
         Expr::Fn(f) => f.ident.is_none(),
         Expr::Class(c) => c.ident.is_none(),
         Expr::Arrow(_) => true,

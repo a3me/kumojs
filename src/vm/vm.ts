@@ -787,59 +787,50 @@ class VM {
             // switch on opcode and execute operation
             switch (op) {
                 // ---- constants and stack
-                // Operation::LoadString(_) => 0x01,
-                case 0x01: {
+                case Op.LoadString: {
                     this.push(this.readString());
                     debug && this.log("OP_LOAD_STRING", this.peek());
                     break;
                 }
-                // Operation::LoadFloat64(_) => 0x02,
-                case 0x02: {
+                case Op.LoadFloat64: {
                     this.push(this.readFloat64());
                     debug && this.log("OP_LOAD_FLOAT64", this.peek());
                     break;
                 }
-                // Operation::Bool(_) => 0x03,
-                case 0x03: {
+                case Op.Bool: {
                     this.push(this.readBool());
                     debug && this.log("OP_LOAD_BOOL", this.peek());
                     break;
                 }
-                // Operation::Null => 0x05,
-                case 0x05: {
+                case Op.Null: {
                     this.push(null);
                     debug && this.log("OP_NULL");
                     break;
                 }
-                // Operation::Undefined => 0x07,
-                case 0x07: {
+                case Op.Undefined: {
                     this.push(undefined);
                     debug && this.log("OP_UNDEFINED");
                     break;
                 }
-                // Operation::UInt8(_) => 0x0b,
-                case 0x0b: {
+                case Op.UInt8: {
                     const value = this.readUInt8();
                     this.push(value);
                     debug && this.log("OP_LOAD_UINT8", value);
                     break;
                 }
-                // Operation::UInt16(_) => 0x0c,
-                case 0x0c: {
+                case Op.UInt16: {
                     const value = this.readUInt16();
                     this.push(value);
                     debug && this.log("OP_LOAD_UINT16", value);
                     break;
                 }
-                // Operation::UInt32(_) => 0x0d,
-                case 0x0d: {
+                case Op.UInt32: {
                     const value = this.readUInt32();
                     this.push(value);
                     debug && this.log("OP_LOAD_UINT32", value);
                     break;
                 }
-                // Operation::UInt64(_) => 0x0e,
-                case 0x0e: {
+                case Op.UInt64: {
                     // JavaScript cannot represent full UInt64 range accurately
                     const low = this.readUInt32();
                     const high = this.readUInt32();
@@ -848,27 +839,23 @@ class VM {
                     debug && this.log("OP_LOAD_UINT64", value);
                     break;
                 }
-                // Operation::LoadBigInt(_) => 0x6d,
-                case 0x6d: {
+                case Op.LoadBigInt: {
                     this.push(HostBigInt!(this.readString()));
                     debug && this.log("OP_LOAD_BIGINT", this.peek());
                     break;
                 }
-                // Operation::Pop => 0x04,
-                case 0x04: {
+                case Op.Pop: {
                     const popped = this.pop();
                     debug && this.log("OP_POP", popped);
                     break;
                 }
-                // Operation::Dup => 0x36,
-                case 0x36: {
+                case Op.Dup: {
                     const value = this.peek();
                     this.push(value);
                     debug && this.log(`OP_DUP`, value);
                     break;
                 }
-                // Operation::Dup2 => 0x42,
-                case 0x42: {
+                case Op.Dup2: {
                     const b = this.stack[this.stack.length - 1];
                     const a = this.stack[this.stack.length - 2];
                     this.push(a);
@@ -878,8 +865,7 @@ class VM {
                 }
 
                 // ---- operators
-                // Operation::EqEq => 0x12,
-                case 0x12: {
+                case Op.EqEq: {
                     const b = this.pop();
                     const a = this.pop();
                     const result = a == b;
@@ -887,8 +873,7 @@ class VM {
                     debug && this.log(`OP_EQ_EQ ${a} == ${b} =>`, result);
                     break;
                 }
-                // Operation::NotEq => 0x13,
-                case 0x13: {
+                case Op.NotEq: {
                     const b = this.pop();
                     const a = this.pop();
                     const result = a != b;
@@ -896,8 +881,7 @@ class VM {
                     debug && this.log(`OP_NOT_EQ ${a} != ${b} =>`, result);
                     break;
                 }
-                // Operation::EqEqEq => 0x14,
-                case 0x14: {
+                case Op.EqEqEq: {
                     const b = this.pop();
                     const a = this.pop();
                     const result = a === b;
@@ -905,8 +889,7 @@ class VM {
                     debug && this.log(`OP_EQ_EQ_EQ ${a} === ${b} =>`, result);
                     break;
                 }
-                // Operation::NotEqEq => 0x15,
-                case 0x15: {
+                case Op.NotEqEq: {
                     const b = this.pop();
                     const a = this.pop();
                     const result = a !== b;
@@ -914,8 +897,7 @@ class VM {
                     debug && this.log(`OP_NOT_EQ_EQ ${a} !== ${b} =>`, result);
                     break;
                 }
-                // Operation::Lt => 0x16,
-                case 0x16: {
+                case Op.Lt: {
                     const b = this.pop();
                     const a = this.pop();
                     const result = a < b;
@@ -923,8 +905,7 @@ class VM {
                     debug && this.log(`OP_LT ${a} < ${b} =>`, result);
                     break;
                 }
-                // Operation::LtEq => 0x17,
-                case 0x17: {
+                case Op.LtEq: {
                     const b = this.pop();
                     const a = this.pop();
                     const result = a <= b;
@@ -932,8 +913,7 @@ class VM {
                     debug && this.log(`OP_LT_EQ ${a} <= ${b} =>`, result);
                     break;
                 }
-                // Operation::Gt => 0x18,
-                case 0x18: {
+                case Op.Gt: {
                     const b = this.pop();
                     const a = this.pop();
                     const result = a > b;
@@ -941,8 +921,7 @@ class VM {
                     debug && this.log(`OP_GT ${a} > ${b} =>`, result);
                     break;
                 }
-                // Operation::GtEq => 0x19,
-                case 0x19: {
+                case Op.GtEq: {
                     const b = this.pop();
                     const a = this.pop();
                     const result = a >= b;
@@ -950,8 +929,7 @@ class VM {
                     debug && this.log(`OP_GT_EQ ${a} >= ${b} =>`, result);
                     break;
                 }
-                // Operation::LShift => 0x1a,
-                case 0x1a: {
+                case Op.LShift: {
                     const b = this.pop();
                     const a = this.pop();
                     const result = a << b;
@@ -959,8 +937,7 @@ class VM {
                     debug && this.log(`OP_LSHIFT ${a} << ${b} =>`, result);
                     break;
                 }
-                // Operation::RShift => 0x1b,
-                case 0x1b: {
+                case Op.RShift: {
                     const b = this.pop();
                     const a = this.pop();
                     const result = a >> b;
@@ -968,8 +945,7 @@ class VM {
                     debug && this.log(`OP_RSHIFT ${a} >> ${b} =>`, result);
                     break;
                 }
-                // Operation::ZeroFillRShift => 0x1c,
-                case 0x1c: {
+                case Op.ZeroFillRShift: {
                     const b = this.pop();
                     const a = this.pop();
                     const result = a >>> b;
@@ -977,8 +953,7 @@ class VM {
                     debug && this.log(`OP_ZERO_FILL_RSHIFT ${a} >>> ${b} =>`, result);
                     break;
                 }
-                // Operation::Add => 0x1d,
-                case 0x1d: {
+                case Op.Add: {
                     const b = this.pop();
                     const a = this.pop();
                     const result = a + b;
@@ -986,8 +961,7 @@ class VM {
                     debug && this.log(`OP_ADD ${a} + ${b} =>`, result);
                     break;
                 }
-                // Operation::Sub => 0x1e,
-                case 0x1e: {
+                case Op.Sub: {
                     const b = this.pop();
                     const a = this.pop();
                     const result = a - b;
@@ -995,8 +969,7 @@ class VM {
                     debug && this.log(`OP_SUB ${a} - ${b} =>`, result);
                     break;
                 }
-                // Operation::Mul => 0x1f,
-                case 0x1f: {
+                case Op.Mul: {
                     const b = this.pop();
                     const a = this.pop();
                     const result = a * b;
@@ -1004,8 +977,7 @@ class VM {
                     debug && this.log(`OP_MUL ${a} * ${b} =>`, result);
                     break;
                 }
-                // Operation::Div => 0x20,
-                case 0x20: {
+                case Op.Div: {
                     const b = this.pop();
                     const a = this.pop();
                     const result = a / b;
@@ -1013,8 +985,7 @@ class VM {
                     debug && this.log(`OP_DIV ${a} / ${b} =>`, result);
                     break;
                 }
-                // Operation::Mod => 0x21,
-                case 0x21: {
+                case Op.Mod: {
                     const b = this.pop();
                     const a = this.pop();
                     const result = a % b;
@@ -1022,8 +993,7 @@ class VM {
                     debug && this.log(`OP_MOD ${a} % ${b} =>`, result);
                     break;
                 }
-                // Operation::BitOr => 0x22,
-                case 0x22: {
+                case Op.BitOr: {
                     const b = this.pop();
                     const a = this.pop();
                     const result = a | b;
@@ -1031,8 +1001,7 @@ class VM {
                     debug && this.log(`OP_BIT_OR ${a} | ${b} =>`, result);
                     break;
                 }
-                // Operation::BitXor => 0x23,
-                case 0x23: {
+                case Op.BitXor: {
                     const b = this.pop();
                     const a = this.pop();
                     const result = a ^ b;
@@ -1040,8 +1009,7 @@ class VM {
                     debug && this.log(`OP_BIT_XOR ${a} ^ ${b} =>`, result);
                     break;
                 }
-                // Operation::BitAnd => 0x24,
-                case 0x24: {
+                case Op.BitAnd: {
                     const b = this.pop();
                     const a = this.pop();
                     const result = a & b;
@@ -1049,8 +1017,7 @@ class VM {
                     debug && this.log(`OP_BIT_AND ${a} & ${b} =>`, result);
                     break;
                 }
-                // Operation::Exp => 0x29,
-                case 0x29: {
+                case Op.Exp: {
                     const b = this.pop();
                     const a = this.pop();
                     const result = a ** b;
@@ -1058,8 +1025,7 @@ class VM {
                     debug && this.log(`OP_EXP ${a} ** ${b} =>`, result);
                     break;
                 }
-                // Operation::In => 0x27,
-                case 0x27: {
+                case Op.In: {
                     const obj = this.pop();
                     const prop = this.pop();
                     const result = prop in obj;
@@ -1067,8 +1033,7 @@ class VM {
                     debug && this.log(`OP_IN ${prop} in`, obj, '=>', result);
                     break;
                 }
-                // Operation::InstanceOf => 0x28,
-                case 0x28: {
+                case Op.InstanceOf: {
                     const constructor = this.pop();
                     const obj = this.pop();
                     const result = obj instanceof constructor;
@@ -1076,75 +1041,65 @@ class VM {
                     debug && this.log(`OP_INSTANCE_OF`, obj, 'instanceof', constructor, '=>', result);
                     break;
                 }
-                // Operation::UnaryMinus => 0x2d,
-                case 0x2d: {
+                case Op.UnaryMinus: {
                     const a = this.pop();
                     const result = -a;
                     this.push(result);
                     debug && this.log(`OP_UNARY_MINUS -${a} =>`, result);
                     break;
                 }
-                // Operation::UnaryPlus => 0x2e,
-                case 0x2e: {
+                case Op.UnaryPlus: {
                     const a = this.pop();
                     const result = +a;
                     this.push(result);
                     debug && this.log(`OP_UNARY_PLUS +${a} =>`, result);
                     break;
                 }
-                // Operation::LogicalNot => 0x2f,
-                case 0x2f: {
+                case Op.LogicalNot: {
                     const a = this.pop();
                     const result = !a;
                     this.push(result);
                     debug && this.log(`OP_LOGICAL_NOT !${a} =>`, result);
                     break;
                 }
-                // Operation::BitwiseNot => 0x30,
-                case 0x30: {
+                case Op.BitwiseNot: {
                     const a = this.pop();
                     const result = ~a;
                     this.push(result);
                     debug && this.log(`OP_BITWISE_NOT ~${a} =>`, result);
                     break;
                 }
-                // Operation::TypeOf => 0x31,
-                case 0x31: {
+                case Op.TypeOf: {
                     const a = this.pop();
                     const result = typeof a;
                     this.push(result);
                     debug && this.log(`OP_TYPEOF typeof ${a} =>`, result);
                     break;
                 }
-                // Operation::Void => 0x32,
-                case 0x32: {
+                case Op.Void: {
                     this.pop();
                     this.push(undefined);
                     debug && this.log(`OP_VOID => undefined`);
                     break;
                 }
-                // Operation::Increment => 0x6e,
-                case 0x6e: {
+                case Op.Increment: {
                     const v = this.stack[this.stack.length - 1];
                     this.stack[this.stack.length - 1] = typeof v === 'bigint' ? v + 1n : +v + 1;
                     break;
                 }
-                // Operation::Decrement => 0x6f,
-                case 0x6f: {
+                case Op.Decrement: {
                     const v = this.stack[this.stack.length - 1];
                     this.stack[this.stack.length - 1] = typeof v === 'bigint' ? v - 1n : +v - 1;
                     break;
                 }
-                // Operation::ToNumeric => 0x70,
-                case 0x70: {
+                case Op.ToNumeric: {
                     const v = this.stack[this.stack.length - 1];
                     if (typeof v !== 'number' && typeof v !== 'bigint') this.stack[this.stack.length - 1] = +v;
                     break;
                 }
 
                 // ---- properties
-                // Operation::GetProperty => 0x10,
-                case 0x10: {
+                case Op.GetProperty: {
                     const propName = this.pop();
                     const obj = this.pop();
                     const value = obj[propName];
@@ -1152,8 +1107,7 @@ class VM {
                     debug && this.log(`OP_GET_PROPERTY ${propName} =`, value);
                     break;
                 }
-                // Operation::SetProperty => 0x11,
-                case 0x11: {
+                case Op.SetProperty: {
                     let value = this.pop();
                     const propName = this.pop();
                     const obj = this.pop();
@@ -1163,8 +1117,7 @@ class VM {
                     debug && this.log(`OP_SET_PROPERTY ${propName} =`, value);
                     break;
                 }
-                // Operation::Delete => 0x33,
-                case 0x33: {
+                case Op.Delete: {
                     const propName = this.pop();
                     const obj = this.pop();
                     const result = delete obj[propName];
@@ -1172,15 +1125,13 @@ class VM {
                     debug && this.log(`OP_DELETE delete ${propName} from`, obj, '=>', result);
                     break;
                 }
-                // Operation::ToPropertyKey => 0x7f,
-                case 0x7f: {
+                case Op.ToPropertyKey: {
                     this.push(toPropertyKey(this.pop()));
                     break;
                 }
 
                 // ---- variables, boxes and the temporal dead zone
-                // Operation::GetLocal(_) => 0x2b,
-                case 0x2b: {
+                case Op.GetLocal: {
                     const localIndex = this.readUInt8();
                     const frame = this.frame;
                     const value = frame.locals[localIndex];
@@ -1188,8 +1139,7 @@ class VM {
                     debug && this.log(`OP_GET_LOCAL index=${localIndex} value=`, value);
                     break;
                 }
-                // Operation::SetLocal(_) => 0x2c,
-                case 0x2c: {
+                case Op.SetLocal: {
                     const localIndex = this.readUInt8();
                     const value = this.peek();  // Don't pop, assignment is an expression
                     const frame = this.frame;
@@ -1197,96 +1147,82 @@ class VM {
                     debug && this.log(`OP_SET_LOCAL index=${localIndex} value=`, value);
                     break;
                 }
-                // Operation::GetUpvalue => 0x38,
-                case 0x38: {
+                case Op.GetUpvalue: {
                     const index = this.readUInt8();
                     const value = this.frame.vf.captures[index].v;
                     this.push(value);
                     debug && this.log(`OP_GET_UPVALUE index=${index} value=`, value);
                     break;
                 }
-                // Operation::SetUpvalue => 0x39,
-                case 0x39: {
+                case Op.SetUpvalue: {
                     const index = this.readUInt8();
                     const value = this.peek(); // Don't pop, assignment is an expression
                     this.frame.vf.captures[index].v = value;
                     debug && this.log(`OP_SET_UPVALUE index=${index} value=`, value);
                     break;
                 }
-                // Operation::GetBox(_) => 0x4c,
-                case 0x4c: {
+                case Op.GetBox: {
                     const slot = this.readUInt8();
                     const value = this.frame.locals[slot].v;
                     this.push(value);
                     debug && this.log(`OP_GET_BOX slot=${slot} value=`, value);
                     break;
                 }
-                // Operation::SetBox(_) => 0x4d,
-                case 0x4d: {
+                case Op.SetBox: {
                     const slot = this.readUInt8();
                     const value = this.peek(); // Don't pop, assignment is an expression
                     this.frame.locals[slot].v = value;
                     debug && this.log(`OP_SET_BOX slot=${slot} value=`, value);
                     break;
                 }
-                // Operation::NewBox(_) => 0x4e,
-                case 0x4e: {
+                case Op.NewBox: {
                     const slot = this.readUInt8();
                     this.frame.locals[slot] = { v: undefined };
                     debug && this.log(`OP_NEW_BOX slot=${slot}`);
                     break;
                 }
-                // Operation::BoxLocal(_) => 0x4f,
-                case 0x4f: {
+                case Op.BoxLocal: {
                     const slot = this.readUInt8();
                     const locals = this.frame.locals;
                     locals[slot] = { v: locals[slot] };
                     debug && this.log(`OP_BOX_LOCAL slot=${slot}`);
                     break;
                 }
-                // Operation::RenewBox(_) => 0x50,
-                case 0x50: {
+                case Op.RenewBox: {
                     const slot = this.readUInt8();
                     const locals = this.frame.locals;
                     locals[slot] = { v: locals[slot].v };
                     debug && this.log(`OP_RENEW_BOX slot=${slot}`);
                     break;
                 }
-                // Operation::NewBoxTdz(_) => 0x86,
-                case 0x86: {
+                case Op.NewBoxTdz: {
                     this.frame.locals[this.readUInt8()] = { v: TDZ };
                     break;
                 }
-                // Operation::Tdz(_) => 0x87,
-                case 0x87: {
+                case Op.Tdz: {
                     this.frame.locals[this.readUInt8()] = TDZ;
                     break;
                 }
-                // Operation::CheckTdz => 0x88,
-                case 0x88: {
+                case Op.CheckTdz: {
                     if (this.stack[this.stack.length - 1] === TDZ) throw tdzError();
                     break;
                 }
-                // Operation::ThrowTdz => 0x89,
-                case 0x89: {
+                case Op.ThrowTdz: {
                     throw tdzError();
                 }
-                // Operation::GetSlotIndex(_, _) => 0x84,
-                case 0x84: {
+                case Op.GetSlotIndex: {
                     const value = this.frame.locals[this.readUInt8()];
                     this.push(value[this.readUInt32()]);
                     break;
                 }
-                // Operation::GetSlotProp(_, _) => 0x85,
-                case 0x85: {
+                case Op.GetSlotProp: {
                     const value = this.frame.locals[this.readUInt8()];
                     this.push(value[this.readString()]);
                     break;
                 }
 
                 // ---- globals, this, arguments
-                // Operation::HostGlobal(_) => 0x40,
-                case 0x40: {
+                case Op.HostGlobal: {
                     const flags = this.readUInt8();
                     const isGlobalThis = (flags & HOST_GLOBAL_IS_GLOBAL_THIS) !== 0;
                     const value = this.hostGlobals[isGlobalThis ? 1 : 0];
@@ -1297,23 +1233,20 @@ class VM {
                     debug && this.log("OP_HOST_GLOBAL", isGlobalThis ? 'globalThis' : 'window');
                     break;
                 }
-                // Operation::This => 0x3f,
-                case 0x3f: {
+                case Op.This: {
                     const value = this.frame.argsFrame.thisValue;
                     if (value === UNINITIALIZED) throw thisError();
                     this.push(value);
                     debug && this.log("OP_THIS", value);
                     break;
                 }
-                // Operation::Callee => 0x43,
-                case 0x43: {
+                case Op.Callee: {
                     const vf = this.frame.vf;
                     this.push(vf.wrapper || vf);
                     debug && this.log("OP_CALLEE");
                     break;
                 }
-                // Operation::Arguments => 0x44,
-                case 0x44: {
+                case Op.Arguments: {
                     const frame = this.frame.argsFrame;
                     if (!frame.argumentsObject) {
                         frame.argumentsObject = makeArguments.apply(undefined, frame.args);
@@ -1322,64 +1255,55 @@ class VM {
                     debug && this.log("OP_ARGUMENTS");
                     break;
                 }
-                // Operation::NewTarget => 0x67,
-                case 0x67: {
+                case Op.NewTarget: {
                     this.push(this.frame.argsFrame.newTarget);
                     debug && this.log("OP_NEW_TARGET");
                     break;
                 }
 
                 // ---- control flow and exceptions
-                // Operation::Jump(_) => 0x3a,
-                case 0x3a: {
+                case Op.Jump: {
                     const offset = this.readUInt32();
                     this.ip += offset;
                     debug && this.log(`OP_JUMP +${offset}`);
                     break;
                 }
-                // Operation::JumpIfFalse(_) => 0x3b,
-                case 0x3b: {
+                case Op.JumpIfFalse: {
                     const offset = this.readUInt32();
                     if (!this.peek()) this.ip += offset;
                     debug && this.log(`OP_JUMP_IF_FALSE +${offset}`);
                     break;
                 }
-                // Operation::JumpIfTrue(_) => 0x3c,
-                case 0x3c: {
+                case Op.JumpIfTrue: {
                     const offset = this.readUInt32();
                     if (this.peek()) this.ip += offset;
                     debug && this.log(`OP_JUMP_IF_TRUE +${offset}`);
                     break;
                 }
-                // Operation::JumpIfNotNullish(_) => 0x3d,
-                case 0x3d: {
+                case Op.JumpIfNotNullish: {
                     const offset = this.readUInt32();
                     const value = this.peek();
                     if (value !== null && value !== undefined) this.ip += offset;
                     debug && this.log(`OP_JUMP_IF_NOT_NULLISH +${offset}`);
                     break;
                 }
-                // Operation::JumpIfNullish => 0x74,
-                case 0x74: {
+                case Op.JumpIfNullish: {
                     const offset = this.readUInt32();
                     const value = this.peek();
                     if (value === null || value === undefined) this.ip += offset;
                     debug && this.log(`OP_JUMP_IF_NULLISH +${offset}`);
                     break;
                 }
-                // Operation::Loop(_) => 0x41,
-                case 0x41: {
+                case Op.Loop: {
                     const offset = this.readUInt32();
                     this.ip -= offset;
                     debug && this.log(`OP_LOOP -${offset}`);
                     break;
                 }
-                // Operation::Throw => 0x46,
-                case 0x46: {
+                case Op.Throw: {
                     throw this.pop();
                 }
-                // Operation::TryStart(_) => 0x47,
-                case 0x47: {
+                case Op.TryStart: {
                     const offset = this.readUInt32();
                     this.handlers.push({
                         callDepth: this.callStack.length,
@@ -1389,48 +1313,43 @@ class VM {
                     debug && this.log("OP_TRY_START");
                     break;
                 }
-                // Operation::TryEnd => 0x48,
-                case 0x48: {
+                case Op.TryEnd: {
                     this.handlers.pop();
                     debug && this.log("OP_TRY_END");
                     break;
                 }
 
                 // ---- calls and functions
-                // Operation::Function => 0x37 (host-callable) / 0x4b (internal: only called
-                // directly from VM code, so no host wrapper is made). The two opcodes share
-                // one decoder; the case decides whether to wrap, so no raw opcode value is
-                // read (which a renumbered build would get wrong).
-                case 0x37: {
+                // A host-callable function, or an internal one (only called directly from VM
+                // code, so no host wrapper is made). The two opcodes share one decoder; the
+                // case decides whether to wrap.
+                case Op.Function: {
                     const vf = this.readFunction();
                     debug && this.log(`OP_FUNCTION name=${vf.name} arity=${vf.arity}`);
                     this.push(this.createHostWrapper(vf));
                     break;
                 }
-                case 0x4b: {
+                case Op.InternalFunction: {
                     const vf = this.readFunction();
                     debug && this.log(`OP_FUNCTION name=${vf.name} arity=${vf.arity} internal`);
                     this.push(vf);
                     break;
                 }
-                // Operation::Call => 0x0f,
-                case 0x0f: {
+                case Op.Call: {
                     const args = this.popArgs();
                     const fn = this.pop();
                     // plain natives keep being called with the host global as `this`
                     this.callFunction(fn, undefined, this.global, args);
                     break;
                 }
-                // Operation::CallMethod => 0x3e,
-                case 0x3e: {
+                case Op.CallMethod: {
                     const args = this.popArgs();
                     const fn = this.pop();
                     const receiver = this.pop();
                     this.callFunction(fn, receiver, receiver, args);
                     break;
                 }
-                // Operation::New => 0x45,
-                case 0x45: {
+                case Op.New: {
                     const args = this.popArgs();
                     const fn = this.pop();
                     if (typeof fn !== 'function') {
@@ -1455,8 +1374,7 @@ class VM {
                     debug && this.log("OP_NEW virtual function");
                     break;
                 }
-                // Operation::Return => 0x08,
-                case 0x08: {
+                case Op.Return: {
                     const frame = this.callStack.pop()!;
                     let returnValue = this.pop();
                     if (frame.isConstruct && !isObject(returnValue)) {
@@ -1485,16 +1403,14 @@ class VM {
                     debug && this.log("OP_RETURN", returnValue);
                     break;
                 }
-                // Operation::SpreadArgs => 0x53,
-                case 0x53: {
+                case Op.SpreadArgs: {
                     const args = this.pop();
                     for (let i = 0; i < args.length; i++) this.push(args[i]);
                     this.push(args.length);
                     debug && this.log("OP_SPREAD_ARGS", args.length);
                     break;
                 }
-                // Operation::RestArgs(_) => 0x54,
-                case 0x54: {
+                case Op.RestArgs: {
                     const start = this.readUInt8();
                     const rest = arraySlice.call(this.frame.args, start);
                     this.push(rest);
@@ -1503,16 +1419,14 @@ class VM {
                 }
 
                 // ---- array, object, template and regex literals
-                // Operation::Regex(_, _) => 0x06,
-                case 0x06: {
+                case Op.Regex: {
                     const exp = this.readString();
                     const flags = this.readString();
                     this.push(new RegExp(exp, flags));
                     debug && this.log(`OP_REGEX exp=${exp} flags=${flags}`);
                     break;
                 }
-                // Operation::Array(_) => 0x34,
-                case 0x34: {
+                case Op.Array: {
                     const count = this.readUInt32();
                     const arr = new Array(count);
                     for (let i = count - 1; i >= 0; i--) {
@@ -1523,13 +1437,11 @@ class VM {
                     debug && this.log(`OP_ARRAY count=${count}`, arr);
                     break;
                 }
-                // Operation::Hole => 0x4a,
-                case 0x4a: {
+                case Op.Hole: {
                     this.push(HOLE);
                     break;
                 }
-                // Operation::ArrayAppend => 0x51,
-                case 0x51: {
+                case Op.ArrayAppend: {
                     const value = this.pop();
                     const arr = this.peek();
                     if (value === HOLE) arr.length++;
@@ -1537,16 +1449,14 @@ class VM {
                     debug && this.log("OP_ARRAY_APPEND", value);
                     break;
                 }
-                // Operation::ArraySpread => 0x52,
-                case 0x52: {
+                case Op.ArraySpread: {
                     const iterable = this.pop();
                     const arr = this.peek();
                     for (const value of iterable) arr.push(value);
                     debug && this.log("OP_ARRAY_SPREAD", arr);
                     break;
                 }
-                // Operation::Object(_) => 0x35,
-                case 0x35: {
+                case Op.Object: {
                     const count = this.readUInt32();
                     // pairs are assigned in source order, so later duplicate keys win
                     const base = this.stack.length - count * 2;
@@ -1561,8 +1471,7 @@ class VM {
                     debug && this.log(`OP_OBJECT count=${count}`, obj);
                     break;
                 }
-                // Operation::ObjectSpread => 0x5d,
-                case 0x5d: {
+                case Op.ObjectSpread: {
                     const source = this.pop();
                     const target = this.peek();
                     if (source !== null && source !== undefined) {
@@ -1576,8 +1485,7 @@ class VM {
                     debug && this.log("OP_OBJECT_SPREAD");
                     break;
                 }
-                // Operation::Template(_) => 0x59,
-                case 0x59: {
+                case Op.Template: {
                     const count = this.readUInt32();
                     const parts = this.stack.splice(this.stack.length - count, count);
                     let result = '';
@@ -1589,8 +1497,7 @@ class VM {
                     debug && this.log("OP_TEMPLATE", result);
                     break;
                 }
-                // Operation::TemplateObject(_) => 0x5a,
-                case 0x5a: {
+                case Op.TemplateObject: {
                     // one frozen strings array per template site, reused on every run
                     const site = this.bytecode.byteOffset + this.ip;
                     const count = this.readUInt32();
@@ -1611,8 +1518,7 @@ class VM {
                     debug && this.log("OP_TEMPLATE_OBJECT", strings);
                     break;
                 }
-                // Operation::ForInKeys => 0x49,
-                case 0x49: {
+                case Op.ForInKeys: {
                     const obj = this.pop();
                     const keys = [];
                     if (obj !== null && obj !== undefined) {
@@ -1624,8 +1530,7 @@ class VM {
                 }
 
                 // ---- destructuring
-                // Operation::RequireObjectCoercible => 0x57,
-                case 0x57: {
+                case Op.RequireObjectCoercible: {
                     const value = this.peek();
                     if (value === null || value === undefined) {
                         throw new TypeError(`Cannot destructure '${value}' as it is ${value}.`);
@@ -1633,22 +1538,19 @@ class VM {
                     debug && this.log("OP_REQUIRE_OBJECT_COERCIBLE");
                     break;
                 }
-                // Operation::IterTake(_) => 0x55,
-                case 0x55: {
+                case Op.IterTake: {
                     const count = this.readUInt32();
                     this.push(iterTake(this.pop(), count));
                     debug && this.log("OP_ITER_TAKE", count);
                     break;
                 }
-                // Operation::ArraySliceFrom(_) => 0x56,
-                case 0x56: {
+                case Op.ArraySliceFrom: {
                     const start = this.readUInt32();
                     this.push(arraySlice.call(this.pop(), start));
                     debug && this.log("OP_ARRAY_SLICE_FROM", start);
                     break;
                 }
-                // Operation::ObjectRest => 0x58,
-                case 0x58: {
+                case Op.ObjectRest: {
                     const keys = this.pop();
                     const source = Object(this.pop());
                     const used = new Set(keys.map((k: any) => typeof k === 'symbol' ? k : String(k)));
@@ -1664,20 +1566,17 @@ class VM {
                 }
 
                 // ---- classes
-                // Operation::SetFunctionName(_) => 0x5e,
-                case 0x5e: {
+                case Op.SetFunctionName: {
                     const prefix = this.readUInt8();
                     nameFunction(this.peek(), this.stack[this.stack.length - 2], prefix);
                     debug && this.log("OP_SET_FUNCTION_NAME");
                     break;
                 }
-                // Operation::MakeClass(_) => 0x5f,
-                case 0x5f: {
+                case Op.MakeClass: {
                     this.opMakeClass();
                     break;
                 }
-                // Operation::DefineMethod(_) => 0x60,
-                case 0x60: {
+                case Op.DefineMethod: {
                     const kind = this.readUInt8();
                     const fn = this.pop();
                     const key = this.pop();
@@ -1691,8 +1590,7 @@ class VM {
                     debug && this.log(`OP_DEFINE_METHOD ${String(key)}`);
                     break;
                 }
-                // Operation::DefineField => 0x5b,
-                case 0x5b: {
+                case Op.DefineField: {
                     const value = this.pop();
                     const key = this.pop();
                     defineProperty(this.peek(), key, dataProperty(value));
@@ -1700,8 +1598,7 @@ class VM {
                     debug && this.log(`OP_DEFINE_FIELD ${String(key)}`, value);
                     break;
                 }
-                // Operation::DefineAccessor(_) => 0x5c,
-                case 0x5c: {
+                case Op.DefineAccessor: {
                     const isSetter = this.readBool();
                     const fn = this.pop();
                     const key = this.pop();
@@ -1713,16 +1610,14 @@ class VM {
                     debug && this.log(`OP_DEFINE_ACCESSOR ${String(key)}`);
                     break;
                 }
-                // Operation::ClassField => 0x61,
-                case 0x61: {
+                case Op.ClassField: {
                     let key = this.pop();
                     if (!(key instanceof PrivateName)) key = toPropertyKey(key);
                     wrappedFunctions.get(this.pop()).fieldKeys.push(key);
                     debug && this.log(`OP_CLASS_FIELD ${String(key)}`);
                     break;
                 }
-                // Operation::StaticField => 0x62,
-                case 0x62: {
+                case Op.StaticField: {
                     const init = this.pop();
                     const key = this.pop();
                     const cls = this.pop();
@@ -1739,8 +1634,7 @@ class VM {
                     debug && this.log(`OP_STATIC_FIELD ${String(key)}`);
                     break;
                 }
-                // Operation::StaticBlock => 0x63,
-                case 0x63: {
+                case Op.StaticBlock: {
                     const fn = this.pop();
                     const cls = this.pop();
                     fn.homeObject = cls;
@@ -1748,14 +1642,12 @@ class VM {
                     debug && this.log("OP_STATIC_BLOCK");
                     break;
                 }
-                // Operation::InitInstance => 0x80,
-                case 0x80: {
+                case Op.InitInstance: {
                     const frame = this.frame;
                     this.initInstance(frame.vf, frame.thisValue);
                     break;
                 }
-                // Operation::SuperCallFinish => 0x81,
-                case 0x81: {
+                case Op.SuperCallFinish: {
                     const result = this.pop();
                     const frame = this.frame.argsFrame;
                     if (frame.thisValue !== UNINITIALIZED) {
@@ -1765,8 +1657,7 @@ class VM {
                     this.initInstance(frame.vf, result);
                     break;
                 }
-                // Operation::InitField(_, _) => 0x82,
-                case 0x82: {
+                case Op.InitField: {
                     const index = this.readUInt32();
                     const nameIt = this.readBool();
                     const value = this.pop();
@@ -1782,8 +1673,7 @@ class VM {
                     }
                     break;
                 }
-                // Operation::ClassInit => 0x83,
-                case 0x83: {
+                case Op.ClassInit: {
                     const fn = this.pop();
                     const classVf = wrappedFunctions.get(this.pop());
                     fn.homeObject = classVf.homeObject;
@@ -1791,13 +1681,11 @@ class VM {
                     classVf.initFn = fn;
                     break;
                 }
-                // Operation::SuperCall => 0x64,
-                case 0x64: {
+                case Op.SuperCall: {
                     this.opSuperCall();
                     break;
                 }
-                // Operation::SuperGet => 0x65,
-                case 0x65: {
+                case Op.SuperGet: {
                     const key = this.pop();
                     const frame = this.frame.argsFrame;
                     if (frame.thisValue === UNINITIALIZED) throw thisError();
@@ -1808,8 +1696,7 @@ class VM {
                     debug && this.log(`OP_SUPER_GET ${String(key)}`, value);
                     break;
                 }
-                // Operation::SuperSet => 0x66,
-                case 0x66: {
+                case Op.SuperSet: {
                     const value = this.pop();
                     const key = this.pop();
                     const frame = this.frame.argsFrame;
@@ -1823,41 +1710,34 @@ class VM {
                     debug && this.log(`OP_SUPER_SET ${String(key)}`, value);
                     break;
                 }
-                // Operation::NewPrivateName(_) => 0x68,
-                case 0x68: {
+                case Op.NewPrivateName: {
                     this.opNewPrivateName();
                     break;
                 }
-                // Operation::PrivateGet => 0x69,
-                case 0x69: {
+                case Op.PrivateGet: {
                     this.opPrivateGet();
                     break;
                 }
-                // Operation::PrivateSet => 0x6a,
-                case 0x6a: {
+                case Op.PrivateSet: {
                     this.opPrivateSet();
                     break;
                 }
-                // Operation::PrivateIn => 0x6b,
-                case 0x6b: {
+                case Op.PrivateIn: {
                     this.opPrivateIn();
                     break;
                 }
-                // Operation::DefinePrivateMethod(_) => 0x6c,
-                case 0x6c: {
+                case Op.DefinePrivateMethod: {
                     this.opDefinePrivateMethod();
                     break;
                 }
 
                 // ---- iteration
-                // Operation::GetIterator => 0x71,
-                case 0x71: {
+                case Op.GetIterator: {
                     this.push(getIterator(this.pop()));
                     debug && this.log("OP_GET_ITERATOR");
                     break;
                 }
-                // Operation::IterNext(_, _) => 0x72,
-                case 0x72: {
+                case Op.IterNext: {
                     const slot = this.readUInt8();
                     const offset = this.readUInt32();
                     const value = iterStep(this.frame.locals[slot]);
@@ -1866,8 +1746,7 @@ class VM {
                     debug && this.log("OP_ITER_NEXT", value);
                     break;
                 }
-                // Operation::IterClose(_, _) => 0x73,
-                case 0x73: {
+                case Op.IterClose: {
                     const slot = this.readUInt8();
                     const quiet = this.readUInt8() === 1;
                     iterClose(this.frame.locals[slot], quiet);
@@ -1876,8 +1755,7 @@ class VM {
                 }
 
                 // ---- async functions
-                // Operation::Await => 0x77,
-                case 0x77: {
+                case Op.Await: {
                     const result = this.opAwait();
                     if (this.callStack.length < entryDepth) return result;
                     this.push(result);

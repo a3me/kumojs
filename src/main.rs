@@ -32,19 +32,32 @@ fn compile(source: &str) -> CompileResponse {
 }
 
 /// Paths of the `.js` files under `dir` (relative to it, `/`-separated), sorted.
-fn list_scripts(dir: &Path, prefix: &str, out: &mut Vec<String>) {
-    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
-        let Ok(name) = entry.file_name().into_string() else {
-            continue;
-        };
-        let path = entry.path();
-        if path.is_dir() {
-            list_scripts(&path, &format!("{prefix}{name}/"), out);
-        } else if name.ends_with(".js") {
-            out.push(format!("{prefix}{name}"));
+fn list_scripts(dir: &Path) -> Vec<String> {
+    fn walk(dir: &Path, prefix: &str, out: &mut Vec<String>) {
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let Ok(name) = entry.file_name().into_string() else {
+                continue;
+            };
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, &format!("{prefix}{name}/"), out);
+            } else if name.ends_with(".js") {
+                out.push(format!("{prefix}{name}"));
+            }
         }
     }
+    let mut out = Vec::new();
+    walk(dir, "", &mut out);
     out.sort();
+    out
+}
+
+/// The script folders the playground lists and serves.
+#[derive(Clone)]
+struct ScriptDirs {
+    examples: PathBuf,
+    fixtures: PathBuf,
+    benchmarks: PathBuf,
 }
 
 #[derive(Serialize)]
@@ -54,15 +67,13 @@ struct Scripts {
     benchmarks: Vec<String>,
 }
 
-fn scripts(examples_dir: &Path, fixtures_dir: &Path, bench_dir: &Path) -> Scripts {
-    let (mut examples, mut fixtures, mut benchmarks) = (Vec::new(), Vec::new(), Vec::new());
-    list_scripts(examples_dir, "", &mut examples);
-    list_scripts(fixtures_dir, "", &mut fixtures);
-    list_scripts(bench_dir, "", &mut benchmarks);
-    Scripts {
-        examples,
-        fixtures,
-        benchmarks,
+impl ScriptDirs {
+    fn list(&self) -> Scripts {
+        Scripts {
+            examples: list_scripts(&self.examples),
+            fixtures: list_scripts(&self.fixtures),
+            benchmarks: list_scripts(&self.benchmarks),
+        }
     }
 }
 
@@ -70,7 +81,11 @@ fn scripts(examples_dir: &Path, fixtures_dir: &Path, bench_dir: &Path) -> Script
 async fn main() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let web = root.join("web");
-    let examples_dir = web.join("examples");
+    let dirs = ScriptDirs {
+        examples: web.join("examples"),
+        fixtures: root.join("tests/fixtures"),
+        benchmarks: root.join("bench/cases"),
+    };
 
     let compile_route = warp::path("compile")
         .and(warp::post())
@@ -78,16 +93,10 @@ async fn main() {
         .and(warp::body::json())
         .map(|request: CompileRequest| warp::reply::json(&compile(&request.source)));
 
-    let fixtures_dir = root.join("tests/fixtures");
-    let bench_dir = root.join("bench/cases");
-    let (list_examples, list_fixtures, list_bench) = (
-        examples_dir.clone(),
-        fixtures_dir.clone(),
-        bench_dir.clone(),
-    );
+    let list_dirs = dirs.clone();
     let scripts_list = warp::path!("scripts")
         .and(warp::get())
-        .map(move || warp::reply::json(&scripts(&list_examples, &list_fixtures, &list_bench)));
+        .map(move || warp::reply::json(&list_dirs.list()));
 
     // the VM is generated from src/vm/vm.ts by build.rs
     let vm_js = warp::path!("vm.js").and(warp::fs::file(root.join("src/vm/vm.js")));
@@ -95,9 +104,9 @@ async fn main() {
     let routes = compile_route
         .or(scripts_list)
         .or(vm_js)
-        .or(warp::path("examples").and(warp::fs::dir(examples_dir)))
-        .or(warp::path("fixtures").and(warp::fs::dir(fixtures_dir)))
-        .or(warp::path("bench").and(warp::fs::dir(bench_dir)))
+        .or(warp::path("examples").and(warp::fs::dir(dirs.examples)))
+        .or(warp::path("fixtures").and(warp::fs::dir(dirs.fixtures)))
+        .or(warp::path("bench").and(warp::fs::dir(dirs.benchmarks)))
         .or(warp::fs::dir(web));
 
     println!("kumojs playground: http://127.0.0.1:3030/");
